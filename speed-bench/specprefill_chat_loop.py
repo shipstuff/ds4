@@ -39,9 +39,16 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# linenoise (ds4's REPL line editor) chokes on huge single-line inputs
+# over a piped stdin.  For any turn longer than this we write it to a
+# tempfile and trigger ds4's `/read FILE` REPL command instead, which
+# bypasses linenoise's line buffer.
+LARGE_TURN_BYTES = 4 * 1024
 
 # ds4's own log lines.  These come from ds4_cli.c (DS4_LOG_PREFILL,
 # DS4_LOG_TIMING) and from ds4.c (DS4_SCORE_VALIDATE path).  Anchored on
@@ -107,14 +114,15 @@ def build_modes(args) -> list[ModeRun]:
 
 
 def load_turns(args) -> list[str]:
-    """Build the multi-turn script.  Turn 1 is the long prompt; subsequent
-    turns are short follow-ups that exercise the model's memory of the
-    compressed history."""
+    """Build the multi-turn script.  Turn 1 is the long prompt
+    (multi-line content is fine -- the runner uses ds4's /read REPL
+    command for large turns); subsequent turns are short follow-ups
+    that exercise the model's memory of the compressed history."""
     if args.turns_file:
         # One turn per non-empty line.
         return [t.rstrip("\n") for t in Path(args.turns_file).read_text().splitlines() if t.strip()]
-    first = Path(args.prompt_file).read_text()
-    return [first.replace("\n", " ").strip()] + list(args.follow_ups)
+    first = Path(args.prompt_file).read_text().rstrip()
+    return [first] + list(args.follow_ups)
 
 
 def feed_repl(args, mode: ModeRun, turns: list[str], stderr_path: Path) -> list[TurnMetrics]:
@@ -148,32 +156,58 @@ def feed_repl(args, mode: ModeRun, turns: list[str], stderr_path: Path) -> list[
         text=True,
         bufsize=1,
     )
-    # We need to know per-turn wall time.  Feed each turn individually,
-    # measuring between turn-input and the "prefill: X t/s, generation: Y
-    # t/s" log line that marks the end of that turn.
-    turns_metrics: list[TurnMetrics] = []
-    current = TurnMetrics(mode=mode.label, turn=0)
-    turn_idx = 0
-    stderr_lines: list[str] = []
-    t_started: float | None = None
-
-    def flush_current(commit: bool = True) -> None:
-        nonlocal current, turn_idx
-        if commit and current.prefill_tps is not None:
-            turns_metrics.append(current)
-        turn_idx += 1
-        current = TurnMetrics(mode=mode.label, turn=turn_idx)
-
-    # Send each turn, then drain stderr lines until the timing line for
-    # that turn appears or the process exits.
     assert proc.stdin is not None and proc.stderr is not None
+
+    # Long-turn tempfiles live until the mode finishes so /read can
+    # finish slurping them.  Cleaned up in the finally block.
+    tmp_paths: list[Path] = []
+
+    def stdin_write(s: str) -> bool:
+        """Write to ds4's stdin.  Returns False (and stops sending more
+        input) if the child has already exited or the pipe is closed."""
+        if proc.poll() is not None:
+            return False
+        try:
+            proc.stdin.write(s)
+            proc.stdin.flush()
+            return True
+        except BrokenPipeError:
+            return False
+
+    turns_metrics: list[TurnMetrics] = []
+    stderr_lines: list[str] = []
+
     try:
         for i, turn in enumerate(turns):
-            t_started = time.perf_counter()
             current = TurnMetrics(mode=mode.label, turn=i)
-            proc.stdin.write(turn + "\n")
-            proc.stdin.flush()
-            # Block-read stderr until we see the timing line for this turn.
+            t_started = time.perf_counter()
+
+            # Long turns go via /read FILE to bypass linenoise's line
+            # buffer; short turns go inline.
+            payload = turn + "\n"
+            if len(payload.encode("utf-8")) > LARGE_TURN_BYTES:
+                fd, tmp = tempfile.mkstemp(
+                    prefix=f"ds4_chatloop_{mode.label}_t{i}_",
+                    suffix=".txt", dir=str(stderr_path.parent),
+                )
+                os.close(fd)
+                tmp_paths.append(Path(tmp))
+                Path(tmp).write_text(turn)
+                ok = stdin_write(f"/read {tmp}\n")
+            else:
+                ok = stdin_write(payload)
+
+            if not ok:
+                exit_code = proc.returncode if proc.poll() is not None else "<still running, pipe closed>"
+                print(
+                    f"  [warn] ds4 stdin closed before turn {i} could be sent "
+                    f"(exit={exit_code}); stopping after captured turns",
+                    file=sys.stderr,
+                )
+                break
+
+            # Block-read stderr until we see the timing line for this turn
+            # or the process exits.
             while True:
                 line = proc.stderr.readline()
                 if not line:
@@ -192,20 +226,44 @@ def feed_repl(args, mode: ModeRun, turns: list[str], stderr_path: Path) -> list[
                 if m:
                     current.prefill_tps = float(m.group(1))
                     current.gen_tps = float(m.group(2))
-                    current.wall_s = time.perf_counter() - (t_started or 0.0)
+                    current.wall_s = time.perf_counter() - t_started
                     turns_metrics.append(current)
                     break
-        # Send /quit and drain remaining output.
-        proc.stdin.write("/quit\n")
-        proc.stdin.close()
-        for line in proc.stderr.read().splitlines(keepends=True):
-            stderr_lines.append(line)
+            else:
+                # readline EOF without a timing match means the child
+                # exited mid-turn.  Record what we have and stop.
+                if (current.prompt_tokens is not None
+                        or current.compressed_tokens is not None):
+                    current.wall_s = time.perf_counter() - t_started
+                    turns_metrics.append(current)
+                print(
+                    f"  [warn] turn {i} did not produce a timing line "
+                    f"(ds4 likely exited; check {stderr_path.name})",
+                    file=sys.stderr,
+                )
+                break
+
+        stdin_write("/quit\n")
+        try:
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+        try:
+            stderr_lines.extend(line for line in proc.stderr.read().splitlines(keepends=True))
+        except Exception:
+            pass
     finally:
         try:
             proc.wait(timeout=args.timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait()
         stderr_path.write_text("".join(stderr_lines))
+        for p in tmp_paths:
+            try:
+                p.unlink()
+            except OSError:
+                pass
 
     return turns_metrics
 
