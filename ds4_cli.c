@@ -50,8 +50,14 @@ typedef struct {
     /* Speculative prefill (experimental dense-decode variant; see ds4.h). */
     bool spec_prefill_enabled;
     float spec_prefill_keep_pct;
+    int spec_prefill_sink;
     int spec_prefill_tail;
     int spec_prefill_chunk;
+    /* When the working-set cache (session_pos + projected turn delta)
+     * reaches this percentage of --ctx, recompress against the full
+     * canonical transcript and invalidate the session.  REPL-only.
+     * Default 85. */
+    int spec_prefill_recompress_at_pct;
     const char *spec_prefill_scores_path;
     /* Native in-engine scoring (calls ds4_engine_score_prompt on the loaded
      * model).  CPU backend only in v1; the CLI falls back to the recency
@@ -166,10 +172,22 @@ static void usage(FILE *fp) {
         "      tail before prefill. Default KEEP_PCT: 0.3. No-op when prompt length\n"
         "      <= --spec-prefill-tail. Without --spec-prefill-scores, the selection\n"
         "      uses a recency heuristic (NOT real SpecPrefill scoring).\n"
+        "  --spec-prefill-sink N\n"
+        "      Number of LEADING prompt tokens always kept (additive to the\n"
+        "      chunk-selected middle, never replaces a chunk).  These 'sink'\n"
+        "      tokens consistently attract disproportionate attention in\n"
+        "      autoregressive transformers; keeping them stabilises the\n"
+        "      compressed prefix.  Default: 16.\n"
         "  --spec-prefill-tail N\n"
         "      Number of trailing prompt tokens always kept. Default: 256.\n"
         "  --spec-prefill-chunk N\n"
         "      Token chunk size for selection. Default: 32.\n"
+        "  --spec-prefill-recompress-at PCT\n"
+        "      REPL-only.  When the working-set cache (session_pos +\n"
+        "      projected delta) reaches PCT %% of --ctx, recompress against\n"
+        "      the full canonical transcript and invalidate the session.\n"
+        "      Default: 85.  Set higher (e.g. 90) when typical turn delta\n"
+        "      is small (< 500 tokens); lower for very chatty turns.\n"
         "  --spec-prefill-scores FILE\n"
         "      Read per-token importance scores (one float per prompt token,\n"
         "      whitespace-separated) from FILE. Produced by either the\n"
@@ -968,6 +986,7 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
     if (cfg->gen.spec_prefill_enabled) {
         ds4_spec_prefill_options spo = ds4_spec_prefill_options_default();
         spo.keep_pct          = cfg->gen.spec_prefill_keep_pct;
+        spo.sink_size         = cfg->gen.spec_prefill_sink;
         spo.tail_size         = cfg->gen.spec_prefill_tail;
         spo.chunk_size        = cfg->gen.spec_prefill_chunk;
         spo.self_score        = cfg->gen.spec_prefill_self_score;
@@ -1006,9 +1025,9 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
         if (cfg->gen.spec_prefill_scores_path) score_src = cfg->gen.spec_prefill_scores_path;
         else if (spo.self_score)               score_src = "self-score";
         ds4_log(stderr, DS4_LOG_PREFILL,
-                "spec-prefill: prompt %d -> %d tokens (keep=%.2f tail=%d chunk=%d scores=%s)\n",
+                "spec-prefill: prompt %d -> %d tokens (keep=%.2f sink=%d tail=%d chunk=%d scores=%s)\n",
                 prompt.len, compressed.len,
-                spo.keep_pct, spo.tail_size, spo.chunk_size, score_src);
+                spo.keep_pct, spo.sink_size, spo.tail_size, spo.chunk_size, score_src);
         ds4_tokens_free(&prompt);
         prompt = compressed;
     }
@@ -1127,6 +1146,20 @@ typedef struct {
     ds4_tokens transcript;
     int ctx_size;
     int max_prefix_tokens;
+    /* SpecPrefill chat-loop state.  When --spec-prefill is enabled, the
+     * model sees a compressed view of the transcript that's smaller than
+     * `transcript` itself.  After the cold compression on the first turn,
+     * subsequent turns extend the session by appending the new content
+     * (user message + assistant prefix + decoded tokens + EOS) to the
+     * live KV cache -- they do NOT recompress, so KV reuse works normally
+     * across turns.  When the working-set cache approaches --ctx we
+     * recompress against the full transcript.
+     *
+     * transcript_consumed_up_to is the chat->transcript.len position
+     * after which the session has not yet seen tokens.  Equal to 0 when
+     * the session is fresh, equal to chat->transcript.len after each
+     * successful sync (and after the post-decode EOS push). */
+    int transcript_consumed_up_to;
 } repl_chat;
 
 static void tokens_insert(ds4_tokens *dst, int pos, const ds4_tokens *src) {
@@ -1168,10 +1201,12 @@ static void repl_chat_apply_max_prefix(ds4_engine *engine, repl_chat *chat, bool
         chat->max_prefix_tokens = prefix.len;
         ds4_tokens_free(&prefix);
         if (chat->session) ds4_session_invalidate(chat->session);
+        chat->transcript_consumed_up_to = 0;
     } else if (!enable && chat->max_prefix_tokens > 0) {
         tokens_remove(&chat->transcript, 1, chat->max_prefix_tokens);
         chat->max_prefix_tokens = 0;
         if (chat->session) ds4_session_invalidate(chat->session);
+        chat->transcript_consumed_up_to = 0;
     }
 }
 
@@ -1209,6 +1244,9 @@ static int repl_chat_set_ctx(ds4_engine *engine, repl_chat *chat, int ctx_size) 
     ds4_session_free(chat->session);
     chat->session = NULL;
     chat->ctx_size = 0;
+    /* New session has empty checkpoint -- force next turn through the
+     * cold-compress path of the SpecPrefill chat-loop strategy. */
+    chat->transcript_consumed_up_to = 0;
     return repl_chat_create_session(engine, chat, ctx_size);
 }
 
@@ -1229,68 +1267,110 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     ds4_chat_append_message(engine, &chat->transcript, "user", user_text);
     ds4_chat_append_assistant_prefix(engine, &chat->transcript, think_mode);
 
-    /* SpecPrefill in REPL: every turn we compress the FULL true transcript
-     * (history + new user msg + assistant prefix) and feed the shorter
-     * compressed form to ds4_session_sync.  The session checkpoint is
-     * invalidated each turn so the compressed prompt is the basis for the
-     * KV cache; chat->transcript stays as the user-facing history that
-     * grows with each generated token.  No incremental KV reuse across
-     * turns when spec-prefill is on -- that's a deliberate trade-off,
-     * since the compressed transcript shape changes every turn anyway. */
+    /* SpecPrefill chat-loop strategy (anemll-team v2):
+     *
+     *   - Cold turn (session_pos == 0): compress the full transcript and
+     *     sync the compressed form.  Cheap.
+     *   - Warm turn under recompress threshold: build sync_target as
+     *     session_view (= current checkpoint) + new delta from the
+     *     transcript, sync that.  ds4_session_sync's common-prefix logic
+     *     finds the existing cache and only prefills the delta.  Cache
+     *     reuse across turns.
+     *   - Warm turn over recompress threshold (working_cache + delta
+     *     approaches --ctx): rescore the FULL canonical transcript,
+     *     compress, invalidate the session, sync the new compressed.
+     *     One expensive turn every N turns; rest stay cheap. */
     ds4_tokens spec_compressed = {0};
+    ds4_tokens warm_target = {0};
     const ds4_tokens *sync_target = &chat->transcript;
+    bool used_warm_extend = false;
     if (cfg->gen.spec_prefill_enabled) {
-        ds4_spec_prefill_options spo = ds4_spec_prefill_options_default();
-        spo.keep_pct          = cfg->gen.spec_prefill_keep_pct;
-        spo.tail_size         = cfg->gen.spec_prefill_tail;
-        spo.chunk_size        = cfg->gen.spec_prefill_chunk;
-        spo.self_score        = cfg->gen.spec_prefill_self_score;
-        spo.score_layers      = cfg->gen.spec_prefill_score_layers;
-        spo.score_lookahead   = cfg->gen.spec_prefill_score_lookahead;
-        spo.score_pool_kernel = cfg->gen.spec_prefill_score_pool_kernel;
+        const int session_pos = ds4_session_pos(chat->session);
+        const int delta_start = chat->transcript_consumed_up_to;
+        const int delta_len   = chat->transcript.len - delta_start;
+        const int recompress_at = (cfg->gen.spec_prefill_recompress_at_pct
+                                   * chat->ctx_size + 50) / 100;
+        const int projected_view = session_pos + delta_len;
+        const bool cold = (session_pos == 0);
+        const bool need_recompress = (!cold) && (projected_view >= recompress_at);
 
-        float *scores_buf = NULL;
-        int    scores_len = 0;
-        if (cfg->gen.spec_prefill_scores_path) {
-            char sferr[256];
-            if (ds4_spec_prefill_load_scores_file(cfg->gen.spec_prefill_scores_path,
-                                                  chat->transcript.len,
-                                                  &scores_buf, &scores_len,
-                                                  sferr, sizeof(sferr)) != 0) {
-                fprintf(stderr, "ds4: %s\n", sferr);
+        if (cold || need_recompress) {
+            ds4_spec_prefill_options spo = ds4_spec_prefill_options_default();
+            spo.keep_pct          = cfg->gen.spec_prefill_keep_pct;
+            spo.sink_size         = cfg->gen.spec_prefill_sink;
+            spo.tail_size         = cfg->gen.spec_prefill_tail;
+            spo.chunk_size        = cfg->gen.spec_prefill_chunk;
+            spo.self_score        = cfg->gen.spec_prefill_self_score;
+            spo.score_layers      = cfg->gen.spec_prefill_score_layers;
+            spo.score_lookahead   = cfg->gen.spec_prefill_score_lookahead;
+            spo.score_pool_kernel = cfg->gen.spec_prefill_score_pool_kernel;
+
+            float *scores_buf = NULL;
+            int    scores_len = 0;
+            if (cfg->gen.spec_prefill_scores_path) {
+                char sferr[256];
+                if (ds4_spec_prefill_load_scores_file(cfg->gen.spec_prefill_scores_path,
+                                                      chat->transcript.len,
+                                                      &scores_buf, &scores_len,
+                                                      sferr, sizeof(sferr)) != 0) {
+                    fprintf(stderr, "ds4: %s\n", sferr);
+                    chat->transcript.len = rollback_len;
+                    return 1;
+                }
+                spo.scores     = scores_buf;
+                spo.scores_len = scores_len;
+                spo.self_score = false;
+            }
+
+            char cerr[256];
+            /* Rescore against the FULL canonical transcript (anemll
+             * critical detail) -- otherwise the rescore is biased by
+             * what's already in the working-set cache. */
+            if (ds4_spec_prefill_compress(engine, &chat->transcript, &spo,
+                                          &spec_compressed, cerr, sizeof(cerr)) != 0) {
+                free(scores_buf);
+                ds4_tokens_free(&spec_compressed); ds4_tokens_free(&warm_target);
                 chat->transcript.len = rollback_len;
+                fprintf(stderr, "ds4: %s\n", cerr);
                 return 1;
             }
-            spo.scores     = scores_buf;
-            spo.scores_len = scores_len;
-            spo.self_score = false;
-        }
-
-        char cerr[256];
-        if (ds4_spec_prefill_compress(engine, &chat->transcript, &spo,
-                                      &spec_compressed, cerr, sizeof(cerr)) != 0) {
             free(scores_buf);
-            ds4_tokens_free(&spec_compressed);
-            chat->transcript.len = rollback_len;
-            fprintf(stderr, "ds4: %s\n", cerr);
-            return 1;
+
+            const char *score_src = "heuristic";
+            if (cfg->gen.spec_prefill_scores_path) score_src = cfg->gen.spec_prefill_scores_path;
+            else if (spo.self_score)               score_src = "self-score";
+            ds4_log(stderr, DS4_LOG_PREFILL,
+                    "spec-prefill: %s prompt %d -> %d tokens "
+                    "(keep=%.2f sink=%d tail=%d chunk=%d scores=%s recompress_at=%d%%)\n",
+                    need_recompress ? "recompress" : "cold",
+                    chat->transcript.len, spec_compressed.len,
+                    spo.keep_pct, spo.sink_size, spo.tail_size, spo.chunk_size,
+                    score_src, cfg->gen.spec_prefill_recompress_at_pct);
+
+            if (need_recompress) {
+                ds4_session_invalidate(chat->session);
+            }
+            sync_target = &spec_compressed;
+        } else {
+            /* Warm extend: pass [current session checkpoint + delta] as the
+             * sync target; ds4_session_sync's common-prefix logic will
+             * detect session_pos common tokens and only prefill the
+             * delta_len suffix.  Full KV reuse across turns. */
+            const ds4_tokens *sv = ds4_session_tokens(chat->session);
+            for (int i = 0; i < sv->len; i++) ds4_tokens_push(&warm_target, sv->v[i]);
+            for (int i = delta_start; i < chat->transcript.len; i++) {
+                ds4_tokens_push(&warm_target, chat->transcript.v[i]);
+            }
+            ds4_log(stderr, DS4_LOG_PREFILL,
+                    "spec-prefill: warm-extend session_pos=%d delta=%d projected=%d "
+                    "(recompress_at=%d%% = %d tokens)\n",
+                    session_pos, delta_len, projected_view,
+                    cfg->gen.spec_prefill_recompress_at_pct, recompress_at);
+            sync_target = &warm_target;
+            used_warm_extend = true;
         }
-        free(scores_buf);
-
-        const char *score_src = "heuristic";
-        if (cfg->gen.spec_prefill_scores_path) score_src = cfg->gen.spec_prefill_scores_path;
-        else if (spo.self_score)               score_src = "self-score";
-        ds4_log(stderr, DS4_LOG_PREFILL,
-                "spec-prefill: prompt %d -> %d tokens (keep=%.2f tail=%d chunk=%d scores=%s)\n",
-                chat->transcript.len, spec_compressed.len,
-                spo.keep_pct, spo.tail_size, spo.chunk_size, score_src);
-
-        /* Drop the live KV checkpoint -- the compressed prompt is a
-         * different token sequence than whatever ds4_session_sync was
-         * tracking from prior turns. */
-        ds4_session_invalidate(chat->session);
-        sync_target = &spec_compressed;
     }
+    (void)used_warm_extend;
 
     const int old_pos = ds4_session_pos(chat->session);
     const int common = ds4_session_common_prefix(chat->session, sync_target);
@@ -1311,7 +1391,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     if (ds4_session_sync(chat->session, sync_target, err, sizeof(err)) != 0) {
         ds4_session_set_progress(chat->session, NULL, NULL);
         ds4_session_set_display_progress(chat->session, NULL, NULL);
-        ds4_tokens_free(&spec_compressed);
+        ds4_tokens_free(&spec_compressed); ds4_tokens_free(&warm_target);
         chat->transcript.len = rollback_len;
         fprintf(stderr, "ds4: prompt processing failed: %s\n", err);
         return 1;
@@ -1361,13 +1441,13 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                                                        sizeof(err));
             if (ntok < 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
-                ds4_tokens_free(&spec_compressed);
+                ds4_tokens_free(&spec_compressed); ds4_tokens_free(&warm_target);
                 return 1;
             }
         } else {
             if (ds4_session_eval(chat->session, token, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
-                ds4_tokens_free(&spec_compressed);
+                ds4_tokens_free(&spec_compressed); ds4_tokens_free(&warm_target);
                 return 1;
             }
             toks[0] = token;
@@ -1398,7 +1478,15 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     if (interrupted && generated == 0) {
         chat->transcript.len = rollback_len;
         ds4_session_invalidate(chat->session);
+        /* Session is fresh again; next turn enters the cold path. */
+        chat->transcript_consumed_up_to = 0;
     } else {
+        /* Mark everything up to (but not including) the post-decode EOS
+         * as "consumed by the session": the session saw the compressed
+         * prompt + assistant prefix + decoded tokens via session_sync +
+         * session_eval, and the EOS we push next is NOT in the session
+         * yet (it'll be the first token of next turn's delta). */
+        chat->transcript_consumed_up_to = chat->transcript.len;
         ds4_tokens_push(&chat->transcript, ds4_token_eos(engine));
     }
 
@@ -1410,7 +1498,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
             "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)suffix / prefill_s : 0.0,
             decode_s > 0.0 ? (double)generated / decode_s : 0.0);
-    ds4_tokens_free(&spec_compressed);
+    ds4_tokens_free(&spec_compressed); ds4_tokens_free(&warm_target);
     return 0;
 }
 
@@ -1603,8 +1691,10 @@ static cli_config parse_options(int argc, char **argv) {
             .think_mode = DS4_THINK_HIGH,
             .spec_prefill_enabled = false,
             .spec_prefill_keep_pct = 0.3f,
+            .spec_prefill_sink = 16,
             .spec_prefill_tail = 256,
             .spec_prefill_chunk = 32,
+            .spec_prefill_recompress_at_pct = 85,
             .spec_prefill_scores_path = NULL,
             .spec_prefill_self_score = false,
             .spec_prefill_score_layers = 2,
@@ -1734,10 +1824,19 @@ static cli_config parse_options(int argc, char **argv) {
                 c.gen.spec_prefill_keep_pct =
                     parse_float_range(arg + 15, "--spec-prefill", 0.0f, 1.0f);
             }
+        } else if (!strcmp(arg, "--spec-prefill-sink")) {
+            c.gen.spec_prefill_sink = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--spec-prefill-tail")) {
             c.gen.spec_prefill_tail = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--spec-prefill-chunk")) {
             c.gen.spec_prefill_chunk = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--spec-prefill-recompress-at")) {
+            int pct = parse_int(need_arg(&i, argc, argv, arg), arg);
+            if (pct < 10 || pct > 99) {
+                fprintf(stderr, "ds4: --spec-prefill-recompress-at must be between 10 and 99\n");
+                exit(2);
+            }
+            c.gen.spec_prefill_recompress_at_pct = pct;
         } else if (!strcmp(arg, "--spec-prefill-scores")) {
             c.gen.spec_prefill_scores_path = need_arg(&i, argc, argv, arg);
             c.gen.spec_prefill_enabled = true;
@@ -1795,6 +1894,7 @@ int main(int argc, char **argv) {
 
         ds4_spec_prefill_options spo = ds4_spec_prefill_options_default();
         spo.keep_pct   = cfg.gen.spec_prefill_keep_pct;
+        spo.sink_size  = cfg.gen.spec_prefill_sink;
         spo.tail_size  = cfg.gen.spec_prefill_tail;
         spo.chunk_size = cfg.gen.spec_prefill_chunk;
 
@@ -1826,8 +1926,8 @@ int main(int argc, char **argv) {
             return 1;
         }
         fprintf(stderr,
-                "spec-prefill dryrun: prompt=%d -> kept=%d (keep=%.2f tail=%d chunk=%d scores=%s)\n",
-                N, compressed.len, spo.keep_pct, spo.tail_size, spo.chunk_size,
+                "spec-prefill dryrun: prompt=%d -> kept=%d (keep=%.2f sink=%d tail=%d chunk=%d scores=%s)\n",
+                N, compressed.len, spo.keep_pct, spo.sink_size, spo.tail_size, spo.chunk_size,
                 cfg.gen.spec_prefill_scores_path ? cfg.gen.spec_prefill_scores_path : "heuristic");
         for (int i = 0; i < compressed.len; i++) {
             printf("%d\n", compressed.v[i]);

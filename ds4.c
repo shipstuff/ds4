@@ -15552,6 +15552,7 @@ bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix) 
 ds4_spec_prefill_options ds4_spec_prefill_options_default(void) {
     ds4_spec_prefill_options o = {0};
     o.keep_pct          = 0.3f;
+    o.sink_size         = 16;
     o.tail_size         = 256;
     o.chunk_size        = 32;
     o.scores            = NULL;
@@ -15661,8 +15662,8 @@ int ds4_spec_prefill_compress(
     ds4_spec_prefill_options opt = opt_in ? *opt_in : ds4_spec_prefill_options_default();
 
     /* Validation and clamping. */
-    if (opt.keep_pct <= 0.0f) {
-        if (err) snprintf(err, errlen, "spec-prefill: keep_pct must be > 0");
+    if (opt.keep_pct < 0.0f) {
+        if (err) snprintf(err, errlen, "spec-prefill: keep_pct must be >= 0");
         return 1;
     }
     if (opt.keep_pct >= 1.0f) {
@@ -15672,12 +15673,20 @@ int ds4_spec_prefill_compress(
     }
     if (opt.chunk_size <= 0) opt.chunk_size = 32;
     if (opt.tail_size  <  0) opt.tail_size  = 0;
+    if (opt.sink_size  <  0) opt.sink_size  = 0;
     int tail_size = opt.tail_size;
+    int sink_size = opt.sink_size;
     if (tail_size > prompt->len) tail_size = prompt->len;
+    /* Sink + tail must fit in the prompt; clamp sink if both are oversized. */
+    if (sink_size + tail_size > prompt->len) {
+        sink_size = prompt->len - tail_size;
+        if (sink_size < 0) sink_size = 0;
+    }
 
-    /* Short prompts: nothing to gain — just copy through.  The selection
-     * machinery below would produce an empty history bucket anyway. */
-    if (prompt->len <= tail_size) {
+    /* Short prompts: nothing to gain — just copy through.  This covers
+     * prompt->len <= sink + tail (every token would be unconditionally
+     * kept anyway). */
+    if (prompt->len <= sink_size + tail_size) {
         ds4_tokens_copy(out, prompt);
         return 0;
     }
@@ -15692,7 +15701,7 @@ int ds4_spec_prefill_compress(
      * run the in-engine scorer.  Failures bubble up unchanged so the user
      * sees the underlying message (e.g. "requires --backend cpu"). */
     float *self_scored = NULL;
-    if (!opt.scores && opt.self_score) {
+    if (!opt.scores && opt.self_score && opt.keep_pct > 0.0f) {
         if (!e) {
             if (err) snprintf(err, errlen,
                     "spec-prefill: self_score requires a non-NULL engine");
@@ -15715,27 +15724,44 @@ int ds4_spec_prefill_compress(
         opt.scores_len = prompt->len;
     }
 
-    const int history_len = prompt->len - tail_size;
+    /* The scorable window is the middle of the prompt: positions
+     * [sink_size .. prompt->len - tail_size).  Sink and tail are kept
+     * unconditionally (additive, never replacing a selected chunk). */
+    const int scorable_start = sink_size;
+    const int scorable_end   = prompt->len - tail_size;
+    const int scorable_len   = scorable_end - scorable_start;
 
-    /* Build per-token importance.  Either the caller-supplied vector or the
-     * recency heuristic (later tokens are more important). */
-    float *importance = xmalloc((size_t)history_len * sizeof(float));
+    /* keep_pct=0: degenerate case -- skip middle entirely, emit just
+     * sink + tail.  Matches the anemll reference fallback. */
+    if (opt.keep_pct == 0.0f || scorable_len == 0) {
+        out->len = 0;
+        for (int t = 0; t < sink_size; t++) token_vec_push(out, prompt->v[t]);
+        for (int t = scorable_end; t < prompt->len; t++) token_vec_push(out, prompt->v[t]);
+        free(self_scored);
+        return 0;
+    }
+
+    /* Build per-token importance for the scorable window.  Either the
+     * caller-supplied vector (sliced) or the recency heuristic. */
+    float *importance = xmalloc((size_t)scorable_len * sizeof(float));
     if (opt.scores) {
-        for (int t = 0; t < history_len; t++) importance[t] = opt.scores[t];
+        for (int t = 0; t < scorable_len; t++) {
+            importance[t] = opt.scores[scorable_start + t];
+        }
     } else {
-        const float denom = (history_len > 1) ? (float)(history_len - 1) : 1.0f;
-        for (int t = 0; t < history_len; t++) {
+        const float denom = (scorable_len > 1) ? (float)(scorable_len - 1) : 1.0f;
+        for (int t = 0; t < scorable_len; t++) {
             importance[t] = (float)t / denom; /* 0..1, monotone */
         }
     }
 
-    /* Chunk the history and score each chunk by mean importance. */
+    /* Chunk the scorable window and score each chunk by mean importance. */
     const int chunk_size = opt.chunk_size;
-    const int n_chunks   = (history_len + chunk_size - 1) / chunk_size;
+    const int n_chunks   = (scorable_len + chunk_size - 1) / chunk_size;
     ds4_chunk_score *chunks = xmalloc((size_t)n_chunks * sizeof(ds4_chunk_score));
     for (int ci = 0; ci < n_chunks; ci++) {
         const int start = ci * chunk_size;
-        const int end   = (start + chunk_size < history_len) ? start + chunk_size : history_len;
+        const int end   = (start + chunk_size < scorable_len) ? start + chunk_size : scorable_len;
         float acc = 0.0f;
         for (int t = start; t < end; t++) acc += importance[t];
         chunks[ci].index = ci;
@@ -15751,17 +15777,19 @@ int ds4_spec_prefill_compress(
     qsort(chunks, (size_t)n_chunks, sizeof(ds4_chunk_score), ds4_chunk_score_cmp_desc);
     qsort(chunks, (size_t)keep_n,   sizeof(ds4_chunk_score), ds4_chunk_score_cmp_index_asc);
 
-    /* Emit the compressed prompt: selected history tokens (in original
-     * order), then the unconditional tail. */
+    /* Emit the compressed prompt: sink + selected middle chunks + tail.
+     * Sink and tail are additive to the chunk-selected set, per the
+     * anemll reference (never replaces a selected chunk). */
     out->len = 0;
+    for (int t = 0; t < sink_size; t++) token_vec_push(out, prompt->v[t]);
     for (int k = 0; k < keep_n; k++) {
         const int ci    = chunks[k].index;
-        const int start = ci * chunk_size;
-        const int end   = (start + chunk_size < history_len) ? start + chunk_size : history_len;
-        for (int t = start; t < end; t++) token_vec_push(out, prompt->v[t]);
+        const int start = scorable_start + ci * chunk_size;
+        const int end_  = start + chunk_size < scorable_end ? start + chunk_size : scorable_end;
+        for (int t = start; t < end_; t++) token_vec_push(out, prompt->v[t]);
     }
     free(chunks);
-    for (int t = history_len; t < prompt->len; t++) token_vec_push(out, prompt->v[t]);
+    for (int t = scorable_end; t < prompt->len; t++) token_vec_push(out, prompt->v[t]);
 
     free(self_scored);
     return 0;

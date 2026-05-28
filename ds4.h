@@ -247,6 +247,14 @@ typedef struct {
      * (returns prompt unchanged).  Default 0.3. */
     float keep_pct;
 
+    /* Number of leading prompt tokens to always include in the compressed
+     * output regardless of score.  These "sink" tokens consistently receive
+     * disproportionate attention in autoregressive transformers; keeping
+     * them stabilises the compressed prefix and is additive to the
+     * chunk-selected middle section (never replaces a selected chunk).
+     * Default 16.  Clamped so sink_size + tail_size <= prompt->len. */
+    int sink_size;
+
     /* Number of trailing prompt tokens to always include in the compressed
      * output regardless of score.  Preserves chat-template tail (im_end /
      * assistant prefix etc).  Default 256.  Clamped to prompt length. */

@@ -1560,6 +1560,7 @@ static void test_spec_prefill_unit(void) {
         const int CHUNK = 32;
         ds4_spec_prefill_options o = ds4_spec_prefill_options_default();
         o.keep_pct = 0.05f;          /* keep ~1 history chunk */
+        o.sink_size = 0;             /* test pure chunk selection here */
         o.tail_size = TAIL;
         o.chunk_size = CHUNK;
         float scores[N];
@@ -1602,14 +1603,32 @@ static void test_spec_prefill_unit(void) {
         ds4_tokens_free(&out);
     }
 
-    /* Case 6: keep_pct <= 0 rejected. */
+    /* Case 6: keep_pct < 0 rejected; keep_pct == 0 returns sink + tail
+     * (graceful fallback, matches the anemll reference).  Task 3. */
     {
         ds4_spec_prefill_options o = ds4_spec_prefill_options_default();
-        o.keep_pct = 0.0f;
+        o.keep_pct = -0.1f;
         ds4_tokens out = {0};
         char err[256];
         int rc = ds4_spec_prefill_compress(NULL, &prompt, &o, &out, err, sizeof(err));
         TEST_ASSERT(rc != 0);
+        ds4_tokens_free(&out);
+    }
+    {
+        const int SINK = 16;
+        const int TAIL = 64;
+        ds4_spec_prefill_options o = ds4_spec_prefill_options_default();
+        o.keep_pct  = 0.0f;
+        o.sink_size = SINK;
+        o.tail_size = TAIL;
+        ds4_tokens out = {0};
+        char err[256];
+        TEST_ASSERT(ds4_spec_prefill_compress(NULL, &prompt, &o, &out, err, sizeof(err)) == 0);
+        TEST_ASSERT(out.len == SINK + TAIL);
+        for (int i = 0; i < SINK; i++) TEST_ASSERT(out.v[i] == prompt.v[i]);
+        for (int i = 0; i < TAIL; i++) {
+            TEST_ASSERT(out.v[SINK + i] == prompt.v[N - TAIL + i]);
+        }
         ds4_tokens_free(&out);
     }
 
@@ -1634,6 +1653,46 @@ static void test_spec_prefill_unit(void) {
         TEST_ASSERT(o.score_layers == 2);
         TEST_ASSERT(o.score_lookahead == 4);
         TEST_ASSERT(o.score_pool_kernel == 13);
+        TEST_ASSERT(o.sink_size == 16);     /* Task 1 default */
+    }
+
+    /* Case 6d: sink + middle chunks + tail layout (Task 1).  Confirms
+     * sink is additive (never replaces a chunk) and the kept-token
+     * count matches sink + selected_chunks + tail. */
+    {
+        const int SINK  = 8;
+        const int TAIL  = 64;
+        const int CHUNK = 32;
+        ds4_spec_prefill_options o = ds4_spec_prefill_options_default();
+        o.keep_pct  = 0.05f;
+        o.sink_size = SINK;
+        o.tail_size = TAIL;
+        o.chunk_size = CHUNK;
+        float scores[N];
+        for (int i = 0; i < N; i++) scores[i] = 0.0f;
+        /* Highlight tokens 100..131 — chunk index (100 - SINK)/CHUNK = 2. */
+        for (int i = 100; i < 132; i++) scores[i] = 10.0f;
+        o.scores = scores;
+        o.scores_len = N;
+        ds4_tokens out = {0};
+        char err[256];
+        TEST_ASSERT(ds4_spec_prefill_compress(NULL, &prompt, &o, &out, err, sizeof(err)) == 0);
+        /* Scorable window = [SINK, N - TAIL) = [8, 960) length 952.
+         * n_chunks = ceil(952/32) = 30; keep_n = ceil(30*0.05) = 2 chunks.
+         * Output = SINK + 2*CHUNK + TAIL. */
+        TEST_ASSERT(out.len == SINK + 2 * CHUNK + TAIL);
+        /* Sink prefix is the first SINK tokens of prompt. */
+        for (int i = 0; i < SINK; i++) TEST_ASSERT(out.v[i] == prompt.v[i]);
+        /* The top chunk in the scorable window starts at chunk_idx 2 in
+         * the scorable window → absolute index SINK + 2*CHUNK = 72.
+         * Wait — token 100 is at scorable-position 92, chunk_idx 92/32 = 2,
+         * so chunk 2 covers scorable positions [64..96) = abs [72..104). */
+        TEST_ASSERT(out.v[SINK] == prompt.v[SINK + 2*CHUNK]);   /* = 72 */
+        /* Tail is the last TAIL tokens of prompt. */
+        for (int i = 0; i < TAIL; i++) {
+            TEST_ASSERT(out.v[out.len - TAIL + i] == prompt.v[N - TAIL + i]);
+        }
+        ds4_tokens_free(&out);
     }
 
     /* Case 7: scores file loader round-trip. */
