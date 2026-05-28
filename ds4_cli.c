@@ -53,9 +53,19 @@ typedef struct {
     int spec_prefill_sink;
     int spec_prefill_tail;
     int spec_prefill_chunk;
-    /* When the working-set cache (session_pos + projected turn delta)
-     * reaches this percentage of --ctx, recompress against the full
-     * canonical transcript and invalidate the session.  REPL-only.
+    /* REPL cache strategy.  false = "fresh" (default): re-score and
+     * re-compress the full transcript every turn -- predictable per-turn
+     * latency, every turn's selection reflects that turn's question, no
+     * staleness.  true = "reuse" (opt-in): compress once then extend the
+     * KV cache incrementally across turns, periodically recompressing.
+     * Cheaper median latency but a sawtooth (recompress turns spike to a
+     * full cold-compression) and deep-history recall degrades between
+     * recompresses.  Right for throughput/batch, wrong default for an
+     * interactive chat REPL where p99 consistency matters more than p50. */
+    bool spec_prefill_cache_reuse;
+    /* reuse mode only: when the working-set cache (session_pos +
+     * projected turn delta) reaches this percentage of --ctx, recompress
+     * against the full canonical transcript and invalidate the session.
      * Default 85. */
     int spec_prefill_recompress_at_pct;
     const char *spec_prefill_scores_path;
@@ -182,8 +192,23 @@ static void usage(FILE *fp) {
         "      Number of trailing prompt tokens always kept. Default: 256.\n"
         "  --spec-prefill-chunk N\n"
         "      Token chunk size for selection. Default: 32.\n"
+        "  --spec-prefill-cache {fresh,reuse}\n"
+        "      REPL cache strategy. Default: fresh.\n"
+        "        fresh  Re-score and re-compress the full transcript every\n"
+        "               turn. Predictable per-turn latency; each turn's\n"
+        "               selection reflects that turn's question; no\n"
+        "               staleness. This is the least-surprising behavior\n"
+        "               for interactive chat and the default.\n"
+        "        reuse  Compress once, then extend the KV cache\n"
+        "               incrementally across turns, recompressing when the\n"
+        "               working set nears --ctx. Trades per-turn selection\n"
+        "               adaptivity for warm-cache throughput: cheaper median\n"
+        "               latency, but deep-history recall degrades between\n"
+        "               recompresses and recompress turns incur a latency\n"
+        "               spike (~one full cold-compression). Prefer for\n"
+        "               throughput/batch workloads, not turn-by-turn chat.\n"
         "  --spec-prefill-recompress-at PCT\n"
-        "      REPL-only.  When the working-set cache (session_pos +\n"
+        "      reuse-mode only. When the working-set cache (session_pos +\n"
         "      projected delta) reaches PCT %% of --ctx, recompress against\n"
         "      the full canonical transcript and invalidate the session.\n"
         "      Default: 85.  Set higher (e.g. 90) when typical turn delta\n"
@@ -1267,34 +1292,62 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     ds4_chat_append_message(engine, &chat->transcript, "user", user_text);
     ds4_chat_append_assistant_prefix(engine, &chat->transcript, think_mode);
 
-    /* SpecPrefill chat-loop strategy (anemll-team v2):
+    /* SpecPrefill chat-loop strategy.  Two lanes, selectable with
+     * --spec-prefill-cache (default: fresh).
      *
-     *   - Cold turn (session_pos == 0): compress the full transcript and
-     *     sync the compressed form.  Cheap.
-     *   - Warm turn under recompress threshold: build sync_target as
-     *     session_view (= current checkpoint) + new delta from the
-     *     transcript, sync that.  ds4_session_sync's common-prefix logic
-     *     finds the existing cache and only prefills the delta.  Cache
-     *     reuse across turns.
-     *   - Warm turn over recompress threshold (working_cache + delta
-     *     approaches --ctx): rescore the FULL canonical transcript,
-     *     compress, invalidate the session, sync the new compressed.
-     *     One expensive turn every N turns; rest stay cheap. */
+     * FRESH (default): re-score and re-compress the full transcript every
+     *   turn, invalidate the session, sync the compressed form.  Per-turn
+     *   latency rises smoothly with context; every turn's selection
+     *   reflects that turn's question; no staleness.  Predictable p99 --
+     *   the right default for an interactive chat REPL.
+     *
+     * REUSE (opt-in): compress-once-extend-incrementally with periodic
+     *   recompress.  Three sub-paths:
+     *     - cold (session_pos == 0): compress full transcript, sync.
+     *     - warm-extend (working set under threshold): sync
+     *       [checkpoint + delta]; ds4_session_sync's common-prefix logic
+     *       reuses the cache and only prefills the delta.
+     *     - recompress (working set nears --ctx): rescore the FULL
+     *       canonical transcript, compress, invalidate, sync.
+     *   Cheaper median latency, but recompress turns spike to a full
+     *   cold-compression and deep-history recall degrades between
+     *   recompresses.  For throughput/batch, not turn-by-turn chat. */
     ds4_tokens spec_compressed = {0};
     ds4_tokens warm_target = {0};
     const ds4_tokens *sync_target = &chat->transcript;
-    bool used_warm_extend = false;
     if (cfg->gen.spec_prefill_enabled) {
+        const bool reuse = cfg->gen.spec_prefill_cache_reuse;
         const int session_pos = ds4_session_pos(chat->session);
         const int delta_start = chat->transcript_consumed_up_to;
         const int delta_len   = chat->transcript.len - delta_start;
         const int recompress_at = (cfg->gen.spec_prefill_recompress_at_pct
                                    * chat->ctx_size + 50) / 100;
         const int projected_view = session_pos + delta_len;
-        const bool cold = (session_pos == 0);
-        const bool need_recompress = (!cold) && (projected_view >= recompress_at);
+        /* reuse-only sub-path selection.  In fresh mode we always
+         * recompress the full transcript (compress + invalidate). */
+        const bool reuse_cold        = reuse && (session_pos == 0);
+        const bool reuse_warm_extend = reuse && (session_pos != 0) &&
+                                       (projected_view < recompress_at);
 
-        if (cold || need_recompress) {
+        if (reuse_warm_extend) {
+            /* Warm extend: pass [current session checkpoint + delta] as the
+             * sync target; ds4_session_sync's common-prefix logic detects
+             * session_pos common tokens and only prefills the delta_len
+             * suffix.  KV reuse across turns. */
+            const ds4_tokens *sv = ds4_session_tokens(chat->session);
+            for (int i = 0; i < sv->len; i++) ds4_tokens_push(&warm_target, sv->v[i]);
+            for (int i = delta_start; i < chat->transcript.len; i++) {
+                ds4_tokens_push(&warm_target, chat->transcript.v[i]);
+            }
+            ds4_log(stderr, DS4_LOG_PREFILL,
+                    "spec-prefill: warm-extend session_pos=%d delta=%d projected=%d "
+                    "(recompress_at=%d%% = %d tokens)\n",
+                    session_pos, delta_len, projected_view,
+                    cfg->gen.spec_prefill_recompress_at_pct, recompress_at);
+            sync_target = &warm_target;
+        } else {
+            /* Compress the full transcript.  This is the fresh-mode path
+             * (every turn) and the reuse-mode cold / recompress paths. */
             ds4_spec_prefill_options spo = ds4_spec_prefill_options_default();
             spo.keep_pct          = cfg->gen.spec_prefill_keep_pct;
             spo.sink_size         = cfg->gen.spec_prefill_sink;
@@ -1323,9 +1376,10 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
             }
 
             char cerr[256];
-            /* Rescore against the FULL canonical transcript (anemll
-             * critical detail) -- otherwise the rescore is biased by
-             * what's already in the working-set cache. */
+            /* Always score against the FULL canonical transcript.  In
+             * reuse-mode recompress this is the anemll critical detail
+             * (don't bias the rescore by the working-set cache); in fresh
+             * mode it's simply how every turn works. */
             if (ds4_spec_prefill_compress(engine, &chat->transcript, &spo,
                                           &spec_compressed, cerr, sizeof(cerr)) != 0) {
                 free(scores_buf);
@@ -1339,38 +1393,24 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
             const char *score_src = "heuristic";
             if (cfg->gen.spec_prefill_scores_path) score_src = cfg->gen.spec_prefill_scores_path;
             else if (spo.self_score)               score_src = "self-score";
+            const char *path_label = !reuse ? "fresh" : (reuse_cold ? "cold" : "recompress");
             ds4_log(stderr, DS4_LOG_PREFILL,
                     "spec-prefill: %s prompt %d -> %d tokens "
-                    "(keep=%.2f sink=%d tail=%d chunk=%d scores=%s recompress_at=%d%%)\n",
-                    need_recompress ? "recompress" : "cold",
+                    "(keep=%.2f sink=%d tail=%d chunk=%d scores=%s)\n",
+                    path_label,
                     chat->transcript.len, spec_compressed.len,
                     spo.keep_pct, spo.sink_size, spo.tail_size, spo.chunk_size,
-                    score_src, cfg->gen.spec_prefill_recompress_at_pct);
+                    score_src);
 
-            if (need_recompress) {
-                ds4_session_invalidate(chat->session);
-            }
+            /* Fresh mode and reuse-recompress both replace the live cache
+             * with a freshly-compressed prompt whose token sequence differs
+             * from whatever the session tracked, so the stale checkpoint
+             * must be dropped.  (reuse-cold starts from an empty session,
+             * so the invalidate is a no-op there but harmless.) */
+            ds4_session_invalidate(chat->session);
             sync_target = &spec_compressed;
-        } else {
-            /* Warm extend: pass [current session checkpoint + delta] as the
-             * sync target; ds4_session_sync's common-prefix logic will
-             * detect session_pos common tokens and only prefill the
-             * delta_len suffix.  Full KV reuse across turns. */
-            const ds4_tokens *sv = ds4_session_tokens(chat->session);
-            for (int i = 0; i < sv->len; i++) ds4_tokens_push(&warm_target, sv->v[i]);
-            for (int i = delta_start; i < chat->transcript.len; i++) {
-                ds4_tokens_push(&warm_target, chat->transcript.v[i]);
-            }
-            ds4_log(stderr, DS4_LOG_PREFILL,
-                    "spec-prefill: warm-extend session_pos=%d delta=%d projected=%d "
-                    "(recompress_at=%d%% = %d tokens)\n",
-                    session_pos, delta_len, projected_view,
-                    cfg->gen.spec_prefill_recompress_at_pct, recompress_at);
-            sync_target = &warm_target;
-            used_warm_extend = true;
         }
     }
-    (void)used_warm_extend;
 
     const int old_pos = ds4_session_pos(chat->session);
     const int common = ds4_session_common_prefix(chat->session, sync_target);
@@ -1694,6 +1734,7 @@ static cli_config parse_options(int argc, char **argv) {
             .spec_prefill_sink = 16,
             .spec_prefill_tail = 256,
             .spec_prefill_chunk = 32,
+            .spec_prefill_cache_reuse = false,
             .spec_prefill_recompress_at_pct = 85,
             .spec_prefill_scores_path = NULL,
             .spec_prefill_self_score = false,
@@ -1830,6 +1871,16 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.spec_prefill_tail = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--spec-prefill-chunk")) {
             c.gen.spec_prefill_chunk = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--spec-prefill-cache")) {
+            const char *mode = need_arg(&i, argc, argv, arg);
+            if (!strcmp(mode, "fresh")) {
+                c.gen.spec_prefill_cache_reuse = false;
+            } else if (!strcmp(mode, "reuse")) {
+                c.gen.spec_prefill_cache_reuse = true;
+            } else {
+                fprintf(stderr, "ds4: --spec-prefill-cache must be 'fresh' or 'reuse'\n");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--spec-prefill-recompress-at")) {
             int pct = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (pct < 10 || pct > 99) {

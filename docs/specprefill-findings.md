@@ -343,75 +343,82 @@ c. **Self-scoring with target = draft.** *"Algorithmically it works —
      attention-extractable model that shares DSV4's tokenizer (or
      a near-enough tokenizer with our `align_scores_to_dsv4.py`).
 
-## Open questions left for the v2 design
+## Implemented in v2 (commit on `seslly/specprefill`)
 
-(After the answers above; what's still genuinely unresolved.)
+1. **`--spec-prefill-sink N`** (default 16). Leading sink tokens kept
+   unconditionally, additive to chunk selection (never replaces a
+   chunk), per anemll. Matches their `sink_size=16` default.
+2. **`keep_pct=0` graceful fallback** — returns sink + tail instead of
+   rejecting. `keep_pct < 0` still rejects.
+3. **`--spec-prefill-cache {fresh,reuse}`** (default **fresh**).
 
-1. **Sink-token preservation** — the anemll defaults keep `sink_size
-   >= 16` to fight MLA-style noise. Worth a `--spec-prefill-sink-size`
-   flag in ds4. Open: should it default to 16 (anemll's number) or
-   something larger for DSV4 (where the noise floor may be wider)?
-2. **Selection stability v2** — the most actionable thing the anemll
-   answer pointed at. *"Force turn N+1's selection to include all of
-   turn N's, with possible extension at the tail."* For DSV4 where
-   per-turn prefill is the bottleneck, this is the only meaningful
-   lever. Open: how strict to make the constraint — full inclusion
-   (no chunks ever drop) vs sticky inclusion (chunks persist for K
-   turns)?
-3. **Cross-impl swap test against the 32k mlx-lm bug** — anemll
-   recommends running their selection through our prefill and our
-   selection through theirs, when long-context regressions appear.
-   For ds4 vs anemll the cross-impl is harder because we don't share
-   a tokenizer or backend, but if we ever see first-token EOS at
-   long DSV4 context the diagnostic is to write a tool that converts
-   ds4's selected indices into a DSV4-tokenized prefill that anemll
-   could read back.
-4. **`keep_pct=0.0` ergonomics** — currently rejected; could match
-   anemll's `[M-1] + sink + tail` behavior. Low priority.
+### The fresh-vs-reuse decision (anemll redirection)
 
-1. **What's a typical per-turn wall time at 30k context on Qwen3.6
-   35B-A3B + dense_decode in your chat loop?** I want a reference
-   point for "this is the UX users actually get". My measurement is
-   that ds4's per-turn cost on DSV4 dominates above ~5–10k context;
-   you may have headroom that just doesn't exist on DSV4 even with
-   perfect engineering.
+The first cut of the cache-reuse work made reuse the *only* REPL
+behavior. That was wrong, and anemll caught it: for interactive
+single-user chat, **p99 consistency beats p50**. A 35 s recompress
+stall dropped into a stream of 3 s warm turns reads to a human as
+"it broke," even when the average latency is lower. So:
 
-2. **Is the per-turn `target_cache = make_prompt_cache()` pattern
-   intentional?** I see persistence machinery (`save_prompt_cache`,
-   `load_prompt_cache`) used for the `optimized_local` mode but not
-   for the SpecPrefill chat loop. Is there a planned-but-not-yet path
-   where the compressed history KV gets cached and reused, or is
-   "re-score-and-re-prefill every turn" the canonical design?
+- **fresh (default)**: re-score + re-compress every turn, invalidate,
+  sync. Per-turn latency rises smoothly with context, no spikes,
+  every turn's selection reflects that turn's question, zero
+  staleness. This is exactly what anemll ships and what they
+  validated as "feeling natural." It is the default.
+- **reuse (opt-in)**: compress-once-extend-incrementally + periodic
+  recompress (`--spec-prefill-recompress-at PCT`, default 85). Cheaper
+  median latency, but it's a sawtooth — recompress turns spike to a
+  full cold-compression, and **deep-history recall degrades between
+  recompresses** because turn N+1's content is appended verbatim, not
+  re-scored, until the next recompress. Right for throughput/batch
+  workloads where nobody's watching turn-by-turn; wrong default for a
+  chat REPL.
 
-3. **On Qwen3.6 35B-A3B + 0.8B draft, what's the rough split of
-   per-turn cost between scoring, target prefill of the compressed
-   prompt, and decode?** I want to know whether SpecPrefill is
-   "essentially free scoring + cheap target prefill" or whether the
-   target prefill alone is the dominant cost. If the latter, ds4's
-   13B-active per token is the inevitable bottleneck and the v2
-   cache-reuse work is the only meaningful win available.
+**Framing correction.** An earlier draft of this doc sold
+selection-stability as the lever that makes the numbers "stop looking
+embarrassing vs baseline." That undersells the trade. reuse mode
+changes *what* gets selected and *when*, not just *caches what fresh
+already selects* — between recompresses, the model is working from a
+selection computed for an older question, and newly-added turns sit
+in the cache un-scored. The p50 win is real; it is paid for in
+adaptivity and p99.
 
-4. **Any edge cases in the dense_decode path that you've hit and
-   patched?** I have the structure down (selected_history at
-   compressed positions 0..H-1 + tail at H..H+T-1, both with
-   standard RoPE) but if there's a known landmine — e.g., a
-   keep_pct value where chunk boundaries land badly, or a
-   tail_size where chat-template tokens get clipped, or a
-   long-context regression analogous to the mlx-lm 32k cache-state
-   bug — I'd rather hear about it before discovering it.
+## Known better-but-harder design (v3, not built)
 
-5. **`_qwen3_next_extract_queries` vs `_qwen35_extract_queries`** —
-   you use the qwen3-next extractor for the Qwen3-Next 0.8B draft,
-   which makes sense. Does the qwen35 extractor differ in a way
-   that matters if a target ever wanted to self-score on a Qwen3.5
-   model the way ds4 self-scores on DSV4? The shape of the issue
-   matters for understanding where DSV4's MLA introduces additional
-   numerical noise that Qwen wouldn't see.
+anemll's suggestion for getting reuse's throughput WITHOUT the p99
+spike: a **sliding window** — recent turns kept verbatim, older turns
+compressed, tokens migrate verbatim→compressed as they age out of the
+recent window. No big-bang recompress, so no latency spike, and the
+recent-window verbatim region preserves adaptivity for the part of
+the conversation most likely to be referenced. This is the design
+that doesn't force a choice between adaptivity and reuse. Materially
+more engineering (incremental cache surgery as tokens migrate), so
+it's a v3 item, but it's the right end state if reuse-class throughput
+is ever needed for interactive chat rather than batch.
+
+## Open questions still genuinely unresolved
+
+1. **Sink default for DSV4** — we ship 16 (anemll's number). The MLA
+   noise floor may be wider on DSV4; whether 16 is enough is an
+   empirical question for the first long-context bench. anemll's
+   escalation path if selection disagreement > 40%: pool_kernel up
+   to 21, chunk down to 8.
+2. **reuse-mode recall degradation magnitude** — how many turns of
+   un-rescored appended content can accumulate before recall visibly
+   degrades is unmeasured on DSV4. The recompress-at default (85%)
+   bounds it by context, not by turn count; a turn-count cap might be
+   a better knob.
+3. **Cross-impl swap test against the 32k mlx-lm bug** — if a
+   long-context DSV4 bench ever shows first-token EOS, the diagnostic
+   is to convert ds4's selected indices into a DSV4-tokenized prefill
+   anemll can read back, and swap selection-vs-prefill across the two
+   implementations the way anemll did for the mlx-lm clean-room port.
 
 ## Where to look
 
 - ds4 changes: `git log --oneline origin/seslly/specprefill` on
-  `shipstuff/ds4` (3 commits: port, bench harness, broken-pipe fix).
+  `shipstuff/ds4` (port, bench harness, broken-pipe fix, this doc,
+  then v2: sink + keep_pct=0 + fresh/reuse cache modes).
 - ds4 measurement artifacts: `metrics.csv` / `metrics2.csv` (live
   next to this doc in the working tree; same fixture, two
   independent runs of `speed-bench/specprefill_chat_loop.py`).
