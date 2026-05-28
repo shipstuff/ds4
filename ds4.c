@@ -8119,6 +8119,485 @@ static void forward_token_raw_swa_cpu(
 }
 #endif
 
+/* =========================================================================
+ * SpecPrefill native scorer (CPU reference path).
+ * =========================================================================
+ *
+ * Computes per-prompt-token importance scores by running the first
+ * `n_score_layers` of DSV4's attention path on the prompt and aggregating
+ * softmax(Q[lookahead] dot K[<=lookahead]) across (layer, head).  Used by
+ * ds4_engine_score_prompt() / ds4_spec_prefill_compress(self_score=true)
+ * when no caller-supplied scores vector is available.
+ *
+ * This is a CPU diagnostic path.  It deliberately avoids the indexer, the
+ * KV compressor, the FFN, the MoE routing, and any layer past
+ * `n_score_layers` -- scoring should cost a small fraction of full prefill
+ * even on this slow reference backend.  A Metal/CUDA fast path would
+ * naturally live next to metal_graph_prefill_*; for v1 the CPU path keeps
+ * the math close to the existing prefill helpers.
+ *
+ * MLA simplification: DSV4 has 1 KV head with head_dim=512 (split into a
+ * rope tail of DS4_N_ROT dims plus the rest).  Multi-head Q broadcasts
+ * against the single shared K when computing scores, just like a GQA model
+ * with kv_heads=1.  This matches the canonical SpecPrefill paper's
+ * attention-aggregation step.
+ */
+static void score_prompt_cpu(
+        float             * scores_out,    /* [n_tok] importance per prompt token */
+        const ds4_model   * model,
+        const ds4_weights * weights,
+        const token_vec   * prompt,
+        uint32_t            n_score_layers,
+        uint32_t            n_lookahead,
+        uint32_t            pool_kernel) {
+    const uint32_t n_tok = (uint32_t)prompt->len;
+    if (n_tok == 0) return;
+    if (n_score_layers == 0) n_score_layers = 2;
+    if (n_lookahead   == 0) n_lookahead   = 4;
+    if (n_score_layers > DS4_N_LAYER) n_score_layers = DS4_N_LAYER;
+    if (n_lookahead   > n_tok)        n_lookahead   = n_tok;
+
+    const uint64_t hc_dim   = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t q_dim    = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint32_t q_rank   = DS4_N_LORA_Q;
+    const uint32_t head_dim = DS4_N_HEAD_DIM;
+    const float    head_inv = 1.0f / sqrtf((float)head_dim);
+
+    /* Token-major hidden state.  Layer score loop reuses `cur` as input;
+     * we never mutate it after embedding because layers in this scorer
+     * only read their input -- no residual updates are needed (we are not
+     * advancing the residual stream, just sampling Q/K). */
+    float *cur = xmalloc((size_t)n_tok * hc_dim * sizeof(cur[0]));
+    float *plain = xmalloc((size_t)DS4_N_EMBD * sizeof(plain[0]));
+    for (uint32_t t = 0; t < n_tok; t++) {
+        embed_token_f16(model, weights, prompt->v[t], plain);
+        hc_from_plain_embedding(cur + (uint64_t)t * hc_dim, plain, DS4_N_EMBD, DS4_N_HC);
+    }
+    free(plain);
+
+    /* Working scratch shared across layers. */
+    float *attn_cur      = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(attn_cur[0]));
+    float *attn_norm     = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(attn_norm[0]));
+    float *attn_residual = xmalloc((size_t)n_tok * hc_dim    * sizeof(attn_residual[0]));
+    float *post          = xmalloc((size_t)n_tok * DS4_N_HC  * sizeof(post[0]));
+    float *comb          = xmalloc((size_t)n_tok * DS4_N_HC * DS4_N_HC * sizeof(comb[0]));
+    float *qr            = xmalloc((size_t)n_tok * q_rank    * sizeof(qr[0]));
+    float *qr_norm       = xmalloc((size_t)n_tok * q_rank    * sizeof(qr_norm[0]));
+    float *q             = xmalloc((size_t)n_tok * q_dim     * sizeof(q[0]));
+    float *kv_raw        = xmalloc((size_t)n_tok * head_dim  * sizeof(kv_raw[0]));
+    float *kv            = xmalloc((size_t)n_tok * head_dim  * sizeof(kv[0]));
+
+    /* Per-token max-pooled importance accumulator (reduced max across
+     * heads and layers, summed across lookahead rows -- normalized at the
+     * very end). */
+    float *importance = xcalloc((size_t)n_tok, sizeof(importance[0]));
+    /* Per-lookahead-row max-over-heads-and-layers buffer, reused. */
+    float *row_max    = xmalloc((size_t)n_tok * sizeof(row_max[0]));
+    /* Per-head softmax row scratch (covers the longest possible query
+     * lookback = n_tok). */
+    float *softmax_row = xmalloc((size_t)n_tok * sizeof(softmax_row[0]));
+
+    const uint32_t lookahead_start = n_tok - n_lookahead;
+    uint32_t total_rows = 0;
+
+    for (uint32_t li = 0; li < n_score_layers; li++) {
+        const ds4_layer_weights *layer = &weights->layer[li];
+        const float *q_a_norm_w = tensor_data(model, layer->attn_q_a_norm);
+        const float *kv_norm_w  = tensor_data(model, layer->attn_kv_a_norm);
+
+        /* HC pre-norm exposes attn_norm[n_tok x DS4_N_EMBD] for the Q/KV
+         * projections.  We discard the post-attention residual buffers. */
+        hc_pre_norm_batch(model,
+                          layer->hc_attn_fn, layer->hc_attn_scale, layer->hc_attn_base,
+                          layer->attn_norm,
+                          cur, attn_residual, attn_cur, attn_norm,
+                          post, comb, n_tok);
+
+        /* Q = q_b(q_a_norm(q_a(attn_norm))), then per-head RMSNorm. */
+        matmul_q8_0_batch(qr, model, layer->attn_q_a, attn_norm, n_tok);
+        for (uint32_t t = 0; t < n_tok; t++) {
+            rms_norm_weight(qr_norm + (uint64_t)t * q_rank,
+                            qr + (uint64_t)t * q_rank,
+                            q_a_norm_w, q_rank, DS4_RMS_EPS);
+        }
+        matmul_q8_0_batch(q, model, layer->attn_q_b, qr_norm, n_tok);
+        for (uint32_t t = 0; t < n_tok; t++) {
+            head_rms_norm_inplace(q + (uint64_t)t * q_dim,
+                                  DS4_N_HEAD, head_dim, DS4_RMS_EPS);
+        }
+
+        /* K_latent = kv_a_norm(attn_kv(attn_norm)).  Single KV head. */
+        matmul_q8_0_batch(kv_raw, model, layer->attn_kv, attn_norm, n_tok);
+        for (uint32_t t = 0; t < n_tok; t++) {
+            rms_norm_weight(kv + (uint64_t)t * head_dim,
+                            kv_raw + (uint64_t)t * head_dim,
+                            kv_norm_w, head_dim, DS4_RMS_EPS);
+        }
+
+        /* RoPE Q and K with absolute positions 0..n_tok-1.  This matches
+         * the contiguous-positions assumption of dense-decode SpecPrefill:
+         * the target sees the compressed prompt at positions 0..M-1, so
+         * scoring also uses contiguous positions. */
+        rope_tail_layer_batch_inplace(q, q_dim,
+                                      DS4_N_HEAD, head_dim, DS4_N_ROT,
+                                      0, li, false, n_tok);
+        rope_tail_layer_batch_inplace(kv, head_dim,
+                                      DS4_N_HEAD_KV, head_dim, DS4_N_ROT,
+                                      0, li, false, n_tok);
+
+        /* For each lookahead query row m, compute attention scores across
+         * positions p in [0, m], softmax, max-reduce over heads, and
+         * accumulate into row_max[].  Then accumulate row_max into the
+         * global importance vector (one mean-reducible contribution per
+         * (layer, query)). */
+        for (uint32_t m = lookahead_start; m < n_tok; m++) {
+            const float *q_m = q + (uint64_t)m * q_dim;       /* (n_head, head_dim) */
+            for (uint32_t p = 0; p <= m; p++) row_max[p] = 0.0f;
+            for (uint32_t p = m + 1; p < n_tok; p++) row_max[p] = 0.0f;
+
+            for (uint32_t h = 0; h < DS4_N_HEAD; h++) {
+                const float *q_mh = q_m + (uint64_t)h * head_dim;
+                /* scores[p] = (q_mh dot kv[p]) * head_inv */
+                float maxs = -1e30f;
+                for (uint32_t p = 0; p <= m; p++) {
+                    const float *k_p = kv + (uint64_t)p * head_dim;
+                    float s = 0.0f;
+                    for (uint32_t d = 0; d < head_dim; d++) s += q_mh[d] * k_p[d];
+                    s *= head_inv;
+                    softmax_row[p] = s;
+                    if (s > maxs) maxs = s;
+                }
+                float sum_exp = 0.0f;
+                for (uint32_t p = 0; p <= m; p++) {
+                    softmax_row[p] = expf(softmax_row[p] - maxs);
+                    sum_exp += softmax_row[p];
+                }
+                if (sum_exp > 0.0f) {
+                    const float inv = 1.0f / sum_exp;
+                    for (uint32_t p = 0; p <= m; p++) {
+                        const float v = softmax_row[p] * inv;
+                        if (v > row_max[p]) row_max[p] = v;
+                    }
+                }
+            }
+            /* Sum row_max into importance.  We're collecting a max-over-
+             * heads-and-layers per (m, p), summed across (m), so the final
+             * normalization divides by total_rows = score_layers *
+             * n_lookahead. */
+            for (uint32_t p = 0; p <= m; p++) importance[p] += row_max[p];
+            total_rows++;
+        }
+
+        /* NOTE: we do not update `cur` between layers.  A faithful prefill
+         * would run attention output + FFN to advance the residual stream.
+         * The SpecPrefill paper observed that early-layer attention is the
+         * dominant importance signal and downstream noise hurts more than
+         * it helps when picking which tokens to drop.  Keeping `cur`
+         * pinned to the embedding HC also removes the need for routing,
+         * FFN, and indexer compute that we don't have a place to put in
+         * this stripped scorer.  Future Metal scorer can revisit. */
+    }
+
+    free(softmax_row);
+    free(row_max);
+    free(kv); free(kv_raw); free(q); free(qr_norm); free(qr);
+    free(comb); free(post); free(attn_residual); free(attn_norm); free(attn_cur);
+    free(cur);
+
+    if (total_rows > 0) {
+        const float inv = 1.0f / (float)total_rows;
+        for (uint32_t t = 0; t < n_tok; t++) importance[t] *= inv;
+    }
+
+    /* Centered avg-pool smoothing (zero-padded at edges).  Mirrors the
+     * pool_kernel parameter of specprefill.score_tokens in the anemll
+     * reference harness; 13 is the paper's default. */
+    if (pool_kernel >= 2) {
+        const uint32_t half = pool_kernel / 2;
+        float *smoothed = xmalloc((size_t)n_tok * sizeof(smoothed[0]));
+        for (uint32_t t = 0; t < n_tok; t++) {
+            uint32_t lo = t > half ? t - half : 0;
+            uint32_t hi = t + half + 1 < n_tok ? t + half + 1 : n_tok;
+            float s = 0.0f;
+            for (uint32_t u = lo; u < hi; u++) s += importance[u];
+            smoothed[t] = s / (float)pool_kernel;
+        }
+        for (uint32_t t = 0; t < n_tok; t++) scores_out[t] = smoothed[t];
+        free(smoothed);
+    } else {
+        for (uint32_t t = 0; t < n_tok; t++) scores_out[t] = importance[t];
+    }
+    free(importance);
+}
+
+#ifndef DS4_NO_GPU
+/* =========================================================================
+ * SpecPrefill native scorer (Metal/CUDA backend variant).
+ * =========================================================================
+ *
+ * Same algorithm as score_prompt_cpu(): for each of the first N attention
+ * layers, run DSV4's MLA Q and K_latent projection paths, apply RoPE, and
+ * aggregate softmax(Q[lookahead] dot K[<=lookahead]) across heads to
+ * produce per-token importance.  The only difference from the CPU scorer
+ * is that the heavy projection work (token embedding, hc_attn_pre,
+ * Q8-weight matmuls, RMS norms, RoPE) runs on the GPU via the existing
+ * ds4_gpu_* primitives -- the same kernels used by the real prefill
+ * graph.  Q and K are read back to host and the score-aggregation loop
+ * runs in C (the per-layer readback is ~30 MB for DSV4 Flash, the
+ * aggregation cost itself is negligible: lookahead * n_head * n_tok =
+ * ~64k FLOPs per layer).
+ *
+ * This avoids writing any new Metal kernels.  A future optimization
+ * could fuse the Q/K product + softmax + capture into a dedicated kernel
+ * to skip the readback, but that's not necessary for correctness and the
+ * v1 path keeps the math in lockstep with prefill (same Metal primitives,
+ * so any drift between scorer and prefill points to a Metal bug not a
+ * scorer bug).
+ *
+ * Returns 0 on success, 1 on failure (any Metal call returning 0). */
+static int score_prompt_metal(
+        float             * scores_out,
+        const ds4_model   * model,
+        const ds4_weights * weights,
+        const token_vec   * prompt,
+        uint32_t            n_score_layers,
+        uint32_t            n_lookahead,
+        uint32_t            pool_kernel) {
+    const uint32_t n_tok = (uint32_t)prompt->len;
+    if (n_tok == 0) return 0;
+    if (n_score_layers == 0) n_score_layers = 2;
+    if (n_lookahead   == 0) n_lookahead   = 4;
+    if (n_score_layers > DS4_N_LAYER) n_score_layers = DS4_N_LAYER;
+    if (n_lookahead   > n_tok)        n_lookahead   = n_tok;
+
+    const uint64_t hc_dim     = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t hc_mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    const uint64_t q_dim      = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint32_t q_rank     = DS4_N_LORA_Q;
+    const uint32_t head_dim   = DS4_N_HEAD_DIM;
+    const float    head_inv   = 1.0f / sqrtf((float)head_dim);
+
+    /* GPU tensors -- match the per-stage layouts of the existing prefill
+     * path.  All scratch; we free everything at the end. */
+    ds4_gpu_tensor *tokens_gpu = ds4_gpu_tensor_alloc((uint64_t)n_tok * sizeof(int32_t));
+    ds4_gpu_tensor *cur_hc     = ds4_gpu_tensor_alloc((uint64_t)n_tok * hc_dim    * sizeof(float));
+    ds4_gpu_tensor *flat_hc    = ds4_gpu_tensor_alloc((uint64_t)n_tok * hc_dim    * sizeof(float));
+    ds4_gpu_tensor *hc_mix     = ds4_gpu_tensor_alloc((uint64_t)n_tok * hc_mix_dim* sizeof(float));
+    ds4_gpu_tensor *hc_split   = ds4_gpu_tensor_alloc((uint64_t)n_tok * hc_mix_dim* sizeof(float));
+    ds4_gpu_tensor *attn_cur   = ds4_gpu_tensor_alloc((uint64_t)n_tok * DS4_N_EMBD* sizeof(float));
+    ds4_gpu_tensor *attn_norm  = ds4_gpu_tensor_alloc((uint64_t)n_tok * DS4_N_EMBD* sizeof(float));
+    ds4_gpu_tensor *qr_gpu     = ds4_gpu_tensor_alloc((uint64_t)n_tok * q_rank    * sizeof(float));
+    ds4_gpu_tensor *qr_norm    = ds4_gpu_tensor_alloc((uint64_t)n_tok * q_rank    * sizeof(float));
+    ds4_gpu_tensor *q_gpu      = ds4_gpu_tensor_alloc((uint64_t)n_tok * q_dim     * sizeof(float));
+    ds4_gpu_tensor *kv_raw     = ds4_gpu_tensor_alloc((uint64_t)n_tok * head_dim  * sizeof(float));
+    ds4_gpu_tensor *kv_gpu     = ds4_gpu_tensor_alloc((uint64_t)n_tok * head_dim  * sizeof(float));
+
+    int rc = 1;
+    if (!tokens_gpu || !cur_hc || !flat_hc || !hc_mix || !hc_split ||
+        !attn_cur || !attn_norm || !qr_gpu || !qr_norm || !q_gpu ||
+        !kv_raw || !kv_gpu) goto cleanup;
+
+    /* Upload token IDs and embed the prompt to HC form. */
+    int32_t *tokens_host = xmalloc((size_t)n_tok * sizeof(int32_t));
+    for (uint32_t t = 0; t < n_tok; t++) tokens_host[t] = prompt->v[t];
+    if (ds4_gpu_tensor_write(tokens_gpu, 0, tokens_host,
+                             (uint64_t)n_tok * sizeof(int32_t)) == 0) {
+        free(tokens_host);
+        goto cleanup;
+    }
+    free(tokens_host);
+
+    /* Host scratch for per-layer Q/K readback and the aggregation pass. */
+    float *q_host = xmalloc((size_t)n_tok * q_dim    * sizeof(float));
+    float *k_host = xmalloc((size_t)n_tok * head_dim * sizeof(float));
+    float *importance = xcalloc((size_t)n_tok, sizeof(float));
+    float *row_max    = xmalloc((size_t)n_tok * sizeof(float));
+    float *softmax_row= xmalloc((size_t)n_tok * sizeof(float));
+
+    const uint32_t lookahead_start = n_tok - n_lookahead;
+    uint32_t total_rows = 0;
+
+    /* Embed once before the layer loop -- mirrors the CPU path which
+     * pins the embedded HC residual stream across scoring layers. */
+    if (!ds4_gpu_begin_commands() ||
+        !ds4_gpu_embed_tokens_hc_tensor(cur_hc, tokens_gpu,
+                                        model->map, model->size,
+                                        weights->token_embd->abs_offset,
+                                        (uint32_t)weights->token_embd->dim[1],
+                                        n_tok, DS4_N_EMBD, DS4_N_HC) ||
+        !ds4_gpu_end_commands()) {
+        goto cleanup_host;
+    }
+    if (!ds4_gpu_synchronize()) goto cleanup_host;
+
+    for (uint32_t li = 0; li < n_score_layers; li++) {
+        const ds4_layer_weights *layer = &weights->layer[li];
+        const bool  compressed  = ds4_layer_compress_ratio(li) != 0;
+        const float freq_base   = layer_rope_freq_base(li);
+        const float freq_scale  = layer_rope_freq_scale(li);
+        const float ext_factor  = compressed && DS4_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
+        float       attn_factor = 1.0f;
+        if (ext_factor != 0.0f && freq_scale > 0.0f) {
+            attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
+        }
+        const uint32_t rope_orig = compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0;
+
+        /* HC pre-norm + hc_attn_fn matmul + sinkhorn split + weighted sum
+         * to produce attn_cur, then RMS-norm to attn_norm.  Same calls as
+         * the real prefill path (ds4.c:12066-12120). */
+        bool ok = ds4_gpu_begin_commands() != 0;
+        if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(flat_hc, cur_hc,
+                                                        (uint32_t)hc_dim, n_tok,
+                                                        DS4_RMS_EPS) != 0;
+        if (ok) ok = ds4_gpu_matmul_f16_tensor(hc_mix,
+                                               model->map, model->size,
+                                               layer->hc_attn_fn->abs_offset,
+                                               hc_dim, hc_mix_dim,
+                                               flat_hc, n_tok) != 0;
+        if (ok) ok = ds4_gpu_hc_split_weighted_sum_tensor(attn_cur, hc_split, hc_mix,
+                                                          cur_hc,
+                                                          model->map, model->size,
+                                                          layer->hc_attn_scale->abs_offset,
+                                                          layer->hc_attn_base->abs_offset,
+                                                          DS4_N_EMBD, DS4_N_HC,
+                                                          DS4_N_HC_SINKHORN_ITER,
+                                                          DS4_HC_EPS) != 0;
+        if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(attn_norm, attn_cur,
+                                                         model->map, model->size,
+                                                         layer->attn_norm->abs_offset,
+                                                         DS4_N_EMBD, n_tok,
+                                                         DS4_RMS_EPS) != 0;
+
+        /* Q lora-down (q_a) and full KV-latent projection.  Then the
+         * fused QKV RMS-norm step that produces qr_norm and kv. */
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(qr_gpu, model->map, model->size,
+                                                layer->attn_q_a->abs_offset,
+                                                DS4_N_EMBD, q_rank,
+                                                attn_norm, n_tok) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(kv_raw, model->map, model->size,
+                                                layer->attn_kv->abs_offset,
+                                                DS4_N_EMBD, head_dim,
+                                                attn_norm, n_tok) != 0;
+        if (ok) ok = ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(qr_norm, qr_gpu,
+                                                           model->map, model->size,
+                                                           layer->attn_q_a_norm->abs_offset,
+                                                           q_rank,
+                                                           kv_gpu, kv_raw,
+                                                           layer->attn_kv_a_norm->abs_offset,
+                                                           head_dim, n_tok,
+                                                           DS4_RMS_EPS) != 0;
+
+        /* Q lora-up (q_b), per-head RMS norm, then RoPE Q and K with
+         * absolute positions 0..n_tok-1 (dense-decode contiguous). */
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(q_gpu, model->map, model->size,
+                                                layer->attn_q_b->abs_offset,
+                                                q_rank, q_dim,
+                                                qr_norm, n_tok) != 0;
+        if (ok) ok = ds4_gpu_head_rms_norm_tensor(q_gpu, n_tok,
+                                                  DS4_N_HEAD, head_dim,
+                                                  DS4_RMS_EPS) != 0;
+        if (ok) ok = ds4_gpu_rope_tail_tensor(q_gpu, n_tok,
+                                              DS4_N_HEAD, head_dim, DS4_N_ROT,
+                                              0, rope_orig, false,
+                                              freq_base, freq_scale,
+                                              ext_factor, attn_factor,
+                                              DS4_ROPE_YARN_BETA_FAST,
+                                              DS4_ROPE_YARN_BETA_SLOW) != 0;
+        if (ok) ok = ds4_gpu_rope_tail_tensor(kv_gpu, n_tok,
+                                              DS4_N_HEAD_KV, head_dim, DS4_N_ROT,
+                                              0, rope_orig, false,
+                                              freq_base, freq_scale,
+                                              ext_factor, attn_factor,
+                                              DS4_ROPE_YARN_BETA_FAST,
+                                              DS4_ROPE_YARN_BETA_SLOW) != 0;
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        if (ok) ok = ds4_gpu_synchronize() != 0;
+        if (!ok) goto cleanup_host;
+
+        /* Read Q (n_tok * n_head * head_dim) and K (n_tok * head_dim) back to
+         * host.  Both fit easily for the prompt sizes ds4 supports. */
+        if (!ds4_gpu_tensor_read(q_gpu, 0, q_host,
+                                 (uint64_t)n_tok * q_dim * sizeof(float))) goto cleanup_host;
+        if (!ds4_gpu_tensor_read(kv_gpu, 0, k_host,
+                                 (uint64_t)n_tok * head_dim * sizeof(float))) goto cleanup_host;
+
+        /* Score-aggregation loop -- bit-identical to the CPU scorer. */
+        for (uint32_t m = lookahead_start; m < n_tok; m++) {
+            const float *q_m = q_host + (uint64_t)m * q_dim;
+            for (uint32_t p = 0; p <= m; p++) row_max[p] = 0.0f;
+            for (uint32_t h = 0; h < DS4_N_HEAD; h++) {
+                const float *q_mh = q_m + (uint64_t)h * head_dim;
+                float maxs = -1e30f;
+                for (uint32_t p = 0; p <= m; p++) {
+                    const float *k_p = k_host + (uint64_t)p * head_dim;
+                    float s = 0.0f;
+                    for (uint32_t d = 0; d < head_dim; d++) s += q_mh[d] * k_p[d];
+                    s *= head_inv;
+                    softmax_row[p] = s;
+                    if (s > maxs) maxs = s;
+                }
+                float sum_exp = 0.0f;
+                for (uint32_t p = 0; p <= m; p++) {
+                    softmax_row[p] = expf(softmax_row[p] - maxs);
+                    sum_exp += softmax_row[p];
+                }
+                if (sum_exp > 0.0f) {
+                    const float inv = 1.0f / sum_exp;
+                    for (uint32_t p = 0; p <= m; p++) {
+                        const float v = softmax_row[p] * inv;
+                        if (v > row_max[p]) row_max[p] = v;
+                    }
+                }
+            }
+            for (uint32_t p = 0; p <= m; p++) importance[p] += row_max[p];
+            total_rows++;
+        }
+    }
+
+    if (total_rows > 0) {
+        const float inv = 1.0f / (float)total_rows;
+        for (uint32_t t = 0; t < n_tok; t++) importance[t] *= inv;
+    }
+    if (pool_kernel >= 2) {
+        const uint32_t half = pool_kernel / 2;
+        float *smoothed = xmalloc((size_t)n_tok * sizeof(float));
+        for (uint32_t t = 0; t < n_tok; t++) {
+            uint32_t lo = t > half ? t - half : 0;
+            uint32_t hi = t + half + 1 < n_tok ? t + half + 1 : n_tok;
+            float s = 0.0f;
+            for (uint32_t u = lo; u < hi; u++) s += importance[u];
+            smoothed[t] = s / (float)pool_kernel;
+        }
+        for (uint32_t t = 0; t < n_tok; t++) scores_out[t] = smoothed[t];
+        free(smoothed);
+    } else {
+        for (uint32_t t = 0; t < n_tok; t++) scores_out[t] = importance[t];
+    }
+    rc = 0;
+
+cleanup_host:
+    free(softmax_row);
+    free(row_max);
+    free(importance);
+    free(k_host);
+    free(q_host);
+cleanup:
+    ds4_gpu_tensor_free(kv_gpu);
+    ds4_gpu_tensor_free(kv_raw);
+    ds4_gpu_tensor_free(q_gpu);
+    ds4_gpu_tensor_free(qr_norm);
+    ds4_gpu_tensor_free(qr_gpu);
+    ds4_gpu_tensor_free(attn_norm);
+    ds4_gpu_tensor_free(attn_cur);
+    ds4_gpu_tensor_free(hc_split);
+    ds4_gpu_tensor_free(hc_mix);
+    ds4_gpu_tensor_free(flat_hc);
+    ds4_gpu_tensor_free(cur_hc);
+    ds4_gpu_tensor_free(tokens_gpu);
+    return rc;
+}
+#endif /* DS4_NO_GPU */
+
 /* CPU prefill in layer-major order.  All prompt tokens pass through layer 0,
  * then layer 1, etc., which exposes batch matmul opportunities. */
 static void prefill_layer_major_cpu(
@@ -15039,6 +15518,255 @@ bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix) 
     return true;
 }
 
+/* =========================================================================
+ * Speculative prefill (dense-decode variant), experimental.
+ * =========================================================================
+ *
+ * See ds4_spec_prefill_options doc in ds4.h.  This file implements the
+ * prompt-compression preprocessor only.  Scoring is brought in by the caller
+ * (anemll harness) via the `scores` field; when scores are absent we fall
+ * back to a recency+stride heuristic so the dense-prefill plumbing remains
+ * exercisable without a draft model.
+ *
+ * Selection algorithm (mirrors specprefill.select_chunks in the harness):
+ *   1.  Pin the last `tail_size` tokens unconditionally.
+ *   2.  Bucket the history (positions 0 .. prompt_len - tail_size - 1) into
+ *       chunks of `chunk_size`.
+ *   3.  Score each chunk by mean-of-token-importance.
+ *   4.  Keep ceil(n_history_chunks * keep_pct) top-scoring chunks.
+ *   5.  Concatenate kept history tokens (in original order) with the tail.
+ *
+ * The output preserves original-order token IDs, so the target model sees
+ * tokens at contiguous positions 0..M-1 where M < prompt_len.  This is the
+ * dense-decode shape: standard RoPE, standard KV cache, standard decode.
+ *
+ * Scoring source (heuristic fallback when scores == NULL):
+ *   Recency-weighted importance: score[t] = (t + 1) / prompt_len.  Combined
+ *   with chunk-mean selection and tail-pinning this approximates "keep the
+ *   end plus a stride sample of history", which is the simplest non-draft
+ *   baseline.  It is NOT a substitute for attention-based scoring; users
+ *   wiring real SpecPrefill should compute scores externally (anemll
+ *   harness) and pass them in.
+ */
+
+ds4_spec_prefill_options ds4_spec_prefill_options_default(void) {
+    ds4_spec_prefill_options o = {0};
+    o.keep_pct          = 0.3f;
+    o.tail_size         = 256;
+    o.chunk_size        = 32;
+    o.scores            = NULL;
+    o.scores_len        = 0;
+    o.self_score        = false;
+    o.score_layers      = 2;
+    o.score_lookahead   = 4;
+    o.score_pool_kernel = 13;
+    return o;
+}
+
+/* Comparator: descending order by .score for chunk picking. */
+typedef struct {
+    int   index;
+    float score;
+} ds4_chunk_score;
+
+static int ds4_chunk_score_cmp_desc(const void *a, const void *b) {
+    const ds4_chunk_score *x = (const ds4_chunk_score *)a;
+    const ds4_chunk_score *y = (const ds4_chunk_score *)b;
+    if (x->score > y->score) return -1;
+    if (x->score < y->score) return  1;
+    /* Stable on equal scores: prefer earlier chunk so output order is
+     * predictable when many chunks tie (heuristic fallback hits this). */
+    if (x->index < y->index) return -1;
+    if (x->index > y->index) return  1;
+    return 0;
+}
+
+static int ds4_chunk_score_cmp_index_asc(const void *a, const void *b) {
+    const ds4_chunk_score *x = (const ds4_chunk_score *)a;
+    const ds4_chunk_score *y = (const ds4_chunk_score *)b;
+    if (x->index < y->index) return -1;
+    if (x->index > y->index) return  1;
+    return 0;
+}
+
+int ds4_spec_prefill_load_scores_file(
+        const char *path,
+        int expected_len,
+        float **out_scores,
+        int *out_len,
+        char *err, size_t errlen) {
+    if (!path || !out_scores || !out_len) {
+        if (err) snprintf(err, errlen, "spec-prefill: load_scores_file null arg");
+        return 1;
+    }
+    *out_scores = NULL;
+    *out_len = 0;
+
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        if (err) snprintf(err, errlen, "spec-prefill: cannot open scores file: %s", path);
+        return 1;
+    }
+    int cap = 1024;
+    int n = 0;
+    float *buf = xmalloc((size_t)cap * sizeof(float));
+    /* One float per whitespace-separated token in the file.  Accept any
+     * mix of newlines/spaces so the anemll harness can emit either layout. */
+    while (1) {
+        double v;
+        int rc = fscanf(fp, "%lf", &v);
+        if (rc == EOF) break;
+        if (rc != 1) {
+            free(buf);
+            fclose(fp);
+            if (err) snprintf(err, errlen, "spec-prefill: malformed scores file at entry %d", n);
+            return 1;
+        }
+        if (n == cap) {
+            cap *= 2;
+            buf = xrealloc(buf, (size_t)cap * sizeof(float));
+        }
+        buf[n++] = (float)v;
+    }
+    fclose(fp);
+
+    if (expected_len > 0 && n != expected_len) {
+        free(buf);
+        if (err) snprintf(err, errlen,
+                "spec-prefill: scores file has %d entries but prompt has %d tokens",
+                n, expected_len);
+        return 1;
+    }
+    *out_scores = buf;
+    *out_len = n;
+    return 0;
+}
+
+int ds4_spec_prefill_compress(
+        ds4_engine *e,
+        const ds4_tokens *prompt,
+        const ds4_spec_prefill_options *opt_in,
+        ds4_tokens *out,
+        char *err, size_t errlen) {
+    (void)e;
+
+    if (!prompt || !out) {
+        if (err) snprintf(err, errlen, "spec-prefill: null prompt or out");
+        return 1;
+    }
+    if (prompt->len <= 0) {
+        out->len = 0;
+        return 0;
+    }
+    ds4_spec_prefill_options opt = opt_in ? *opt_in : ds4_spec_prefill_options_default();
+
+    /* Validation and clamping. */
+    if (opt.keep_pct <= 0.0f) {
+        if (err) snprintf(err, errlen, "spec-prefill: keep_pct must be > 0");
+        return 1;
+    }
+    if (opt.keep_pct >= 1.0f) {
+        /* No compression — caller asked to keep everything.  Copy and return. */
+        ds4_tokens_copy(out, prompt);
+        return 0;
+    }
+    if (opt.chunk_size <= 0) opt.chunk_size = 32;
+    if (opt.tail_size  <  0) opt.tail_size  = 0;
+    int tail_size = opt.tail_size;
+    if (tail_size > prompt->len) tail_size = prompt->len;
+
+    /* Short prompts: nothing to gain — just copy through.  The selection
+     * machinery below would produce an empty history bucket anyway. */
+    if (prompt->len <= tail_size) {
+        ds4_tokens_copy(out, prompt);
+        return 0;
+    }
+    if (opt.scores && opt.scores_len != prompt->len) {
+        if (err) snprintf(err, errlen,
+                "spec-prefill: scores_len=%d does not match prompt->len=%d",
+                opt.scores_len, prompt->len);
+        return 1;
+    }
+
+    /* When the caller asks for native scoring and no scores were supplied,
+     * run the in-engine scorer.  Failures bubble up unchanged so the user
+     * sees the underlying message (e.g. "requires --backend cpu"). */
+    float *self_scored = NULL;
+    if (!opt.scores && opt.self_score) {
+        if (!e) {
+            if (err) snprintf(err, errlen,
+                    "spec-prefill: self_score requires a non-NULL engine");
+            return 1;
+        }
+        self_scored = xmalloc((size_t)prompt->len * sizeof(float));
+        char serr[256];
+        int src = ds4_engine_score_prompt(
+                e, prompt,
+                opt.score_layers      > 0 ? opt.score_layers      : 2,
+                opt.score_lookahead   > 0 ? opt.score_lookahead   : 4,
+                opt.score_pool_kernel >= 0 ? opt.score_pool_kernel : 13,
+                self_scored, serr, sizeof(serr));
+        if (src != 0) {
+            free(self_scored);
+            if (err) snprintf(err, errlen, "%s", serr);
+            return src;
+        }
+        opt.scores     = self_scored;
+        opt.scores_len = prompt->len;
+    }
+
+    const int history_len = prompt->len - tail_size;
+
+    /* Build per-token importance.  Either the caller-supplied vector or the
+     * recency heuristic (later tokens are more important). */
+    float *importance = xmalloc((size_t)history_len * sizeof(float));
+    if (opt.scores) {
+        for (int t = 0; t < history_len; t++) importance[t] = opt.scores[t];
+    } else {
+        const float denom = (history_len > 1) ? (float)(history_len - 1) : 1.0f;
+        for (int t = 0; t < history_len; t++) {
+            importance[t] = (float)t / denom; /* 0..1, monotone */
+        }
+    }
+
+    /* Chunk the history and score each chunk by mean importance. */
+    const int chunk_size = opt.chunk_size;
+    const int n_chunks   = (history_len + chunk_size - 1) / chunk_size;
+    ds4_chunk_score *chunks = xmalloc((size_t)n_chunks * sizeof(ds4_chunk_score));
+    for (int ci = 0; ci < n_chunks; ci++) {
+        const int start = ci * chunk_size;
+        const int end   = (start + chunk_size < history_len) ? start + chunk_size : history_len;
+        float acc = 0.0f;
+        for (int t = start; t < end; t++) acc += importance[t];
+        chunks[ci].index = ci;
+        chunks[ci].score = acc / (float)(end - start);
+    }
+    free(importance);
+
+    /* Select top-keep_pct chunks by score, then re-sort kept chunks by their
+     * original index so output order is preserved. */
+    int keep_n = (int)ceilf((float)n_chunks * opt.keep_pct);
+    if (keep_n < 1) keep_n = 1;
+    if (keep_n > n_chunks) keep_n = n_chunks;
+    qsort(chunks, (size_t)n_chunks, sizeof(ds4_chunk_score), ds4_chunk_score_cmp_desc);
+    qsort(chunks, (size_t)keep_n,   sizeof(ds4_chunk_score), ds4_chunk_score_cmp_index_asc);
+
+    /* Emit the compressed prompt: selected history tokens (in original
+     * order), then the unconditional tail. */
+    out->len = 0;
+    for (int k = 0; k < keep_n; k++) {
+        const int ci    = chunks[k].index;
+        const int start = ci * chunk_size;
+        const int end   = (start + chunk_size < history_len) ? start + chunk_size : history_len;
+        for (int t = start; t < end; t++) token_vec_push(out, prompt->v[t]);
+    }
+    free(chunks);
+    for (int t = history_len; t < prompt->len; t++) token_vec_push(out, prompt->v[t]);
+
+    free(self_scored);
+    return 0;
+}
+
 struct ds4_vocab {
     ds4_str *token;
     int n_vocab;
@@ -17794,6 +18522,163 @@ int ds4_engine_generate_argmax(
                                 e->directional_steering_attn_scale,
                                 e->directional_steering_ffn_scale,
                                 emit, done, emit_ud, progress, progress_ud);
+}
+
+/* Native SpecPrefill scorer — see ds4.h for the algorithm doc.  Dispatches
+ * to the CPU helper or the GPU helper depending on the engine's backend;
+ * both compute the same per-token importance vector, the only difference
+ * is which kernels run the projections. */
+int ds4_engine_score_prompt(
+        ds4_engine *e,
+        const ds4_tokens *prompt,
+        int score_layers,
+        int score_lookahead,
+        int pool_kernel,
+        float *scores_out,
+        char *err, size_t errlen) {
+    if (!e || !prompt || !scores_out) {
+        if (err) snprintf(err, errlen, "score_prompt: null arg");
+        return 1;
+    }
+    if (prompt->len <= 0) {
+        if (err) snprintf(err, errlen, "score_prompt: empty prompt");
+        return 1;
+    }
+    if (score_layers   <= 0) score_layers   = 2;
+    if (score_lookahead<= 0) score_lookahead= 4;
+    if (pool_kernel    <  0) pool_kernel    = 13;
+
+    if (e->backend == DS4_BACKEND_CPU) {
+        score_prompt_cpu(scores_out,
+                         &e->model, &e->weights,
+                         prompt,
+                         (uint32_t)score_layers,
+                         (uint32_t)score_lookahead,
+                         (uint32_t)pool_kernel);
+        return 0;
+    }
+#ifndef DS4_NO_GPU
+    if (ds4_backend_uses_graph(e->backend)) {
+        if (!e->metal_ready) {
+            if (err) snprintf(err, errlen,
+                    "score_prompt: %s backend selected but graph runtime is not initialized",
+                    ds4_backend_name(e->backend));
+            return 1;
+        }
+        int src = score_prompt_metal(scores_out,
+                                     &e->model, &e->weights,
+                                     prompt,
+                                     (uint32_t)score_layers,
+                                     (uint32_t)score_lookahead,
+                                     (uint32_t)pool_kernel);
+        if (src != 0 && err) {
+            snprintf(err, errlen,
+                    "score_prompt: %s graph scorer failed (a ds4_gpu_* call returned 0)",
+                    ds4_backend_name(e->backend));
+        }
+        /* Optional in-place parity check: when DS4_SCORE_VALIDATE is set
+         * we also run the CPU scorer over the same model+prompt and emit
+         * max-abs-diff to stderr.  This is the cheapest way to verify
+         * that the Metal/CUDA composition lines up with the reference
+         * CPU path on the same engine.  Disabled by default because it
+         * doubles the scoring cost. */
+        if (src == 0 && getenv("DS4_SCORE_VALIDATE")) {
+            float *cpu_scores = xmalloc((size_t)prompt->len * sizeof(float));
+            score_prompt_cpu(cpu_scores,
+                             &e->model, &e->weights,
+                             prompt,
+                             (uint32_t)score_layers,
+                             (uint32_t)score_lookahead,
+                             (uint32_t)pool_kernel);
+            double max_abs = 0.0, sum_abs = 0.0, sum_sq = 0.0;
+            float maxv_metal = 0.0f, maxv_cpu = 0.0f;
+            for (int i = 0; i < prompt->len; i++) {
+                double d = fabs((double)scores_out[i] - (double)cpu_scores[i]);
+                if (d > max_abs) max_abs = d;
+                sum_abs += d;
+                sum_sq  += d * d;
+                if (scores_out[i] > maxv_metal) maxv_metal = scores_out[i];
+                if (cpu_scores[i] > maxv_cpu)   maxv_cpu   = cpu_scores[i];
+            }
+            const double mean_abs = sum_abs / (double)prompt->len;
+            const double rms      = sqrt(sum_sq / (double)prompt->len);
+            ds4_log(stderr, DS4_LOG_TIMING,
+                    "spec-prefill validate: n=%d max|m-c|=%.6f mean|m-c|=%.6f rms=%.6f "
+                    "max_metal=%.6f max_cpu=%.6f\n",
+                    prompt->len, max_abs, mean_abs, rms, maxv_metal, maxv_cpu);
+            free(cpu_scores);
+        }
+        return src;
+    }
+#endif
+    if (err) snprintf(err, errlen,
+            "score_prompt: unsupported backend %s",
+            ds4_backend_name(e->backend));
+    return 1;
+}
+
+int ds4_engine_score_prompt_validate(
+        ds4_engine *e,
+        const ds4_tokens *prompt,
+        int score_layers,
+        int score_lookahead,
+        int pool_kernel,
+        float *scores_cpu_out,
+        float *scores_graph_out,
+        float *max_abs_diff_out,
+        char *err, size_t errlen) {
+    if (!e || !prompt || !scores_cpu_out || !scores_graph_out) {
+        if (err) snprintf(err, errlen, "score_prompt_validate: null arg");
+        return 1;
+    }
+    if (prompt->len <= 0) {
+        if (err) snprintf(err, errlen, "score_prompt_validate: empty prompt");
+        return 1;
+    }
+    if (score_layers   <= 0) score_layers   = 2;
+    if (score_lookahead<= 0) score_lookahead= 4;
+    if (pool_kernel    <  0) pool_kernel    = 13;
+
+    score_prompt_cpu(scores_cpu_out,
+                     &e->model, &e->weights,
+                     prompt,
+                     (uint32_t)score_layers,
+                     (uint32_t)score_lookahead,
+                     (uint32_t)pool_kernel);
+
+#ifndef DS4_NO_GPU
+    if (!ds4_backend_uses_graph(e->backend) || !e->metal_ready) {
+        if (err) snprintf(err, errlen,
+                "score_prompt_validate: engine has no graph backend (open with --backend metal or --backend cuda)");
+        return 1;
+    }
+    int src = score_prompt_metal(scores_graph_out,
+                                 &e->model, &e->weights,
+                                 prompt,
+                                 (uint32_t)score_layers,
+                                 (uint32_t)score_lookahead,
+                                 (uint32_t)pool_kernel);
+    if (src != 0) {
+        if (err) snprintf(err, errlen,
+                "score_prompt_validate: graph scorer failed (a ds4_gpu_* call returned 0)");
+        return src;
+    }
+#else
+    (void)scores_graph_out;
+    if (err) snprintf(err, errlen,
+            "score_prompt_validate: this build has no graph backend (rebuild without DS4_NO_GPU)");
+    return 1;
+#endif
+
+    if (max_abs_diff_out) {
+        double m = 0.0;
+        for (int i = 0; i < prompt->len; i++) {
+            double d = fabs((double)scores_cpu_out[i] - (double)scores_graph_out[i]);
+            if (d > m) m = d;
+        }
+        *max_abs_diff_out = (float)m;
+    }
+    return 0;
 }
 
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {

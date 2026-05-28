@@ -206,6 +206,160 @@ bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 
+/* Speculative prefill (SpecPrefill, dense-decode variant).
+ *
+ * Experimental, opt-in prompt preprocessor.  Given a prompt and a per-token
+ * importance score vector, picks the most important fixed-size chunks of the
+ * history, keeps the last `tail_size` tokens unconditionally, concatenates
+ * them in original order, and writes the compressed list to `out`.  The
+ * caller then feeds the compressed prompt to the normal prefill path
+ * (ds4_session_sync, ds4_engine_generate_argmax); the target sees the
+ * shortened prompt at contiguous positions, so the regular RoPE / KV cache
+ * path is unchanged and decode runs at baseline speed.
+ *
+ * Scoring can come from three places:
+ *   1. Caller-provided `scores` vector (use when an external draft like
+ *      anemll-project's score_tokens(), or the bundled
+ *      misc/tools/dump_specprefill_scores.py, has already produced scores).
+ *   2. ds4's own native scorer when `self_score = true` (no `scores` vector
+ *      needed).  Calls ds4_engine_score_prompt() internally — see that
+ *      function for the attention-aggregation algorithm.  Available on all
+ *      backends: the CPU path runs the projections via ds4's CPU reference
+ *      helpers, the Metal/CUDA path runs them via the same ds4_gpu_*
+ *      primitives the real prefill graph uses (Q and K are read back to
+ *      host for the per-layer score aggregation).
+ *   3. Recency heuristic fallback when neither is provided.
+ *
+ * Background: this is a port of the dense-decode SpecPrefill variant from
+ * carl/anemll-project (vllm-mlx lineage).  The Python harness uses a small
+ * draft model (Qwen-Next 0.8B) to score importance for a much larger target.
+ * ds4 is DSV4-Flash-specific and has no second-model runtime; ports therefore
+ * source scores externally (anemll harness writes them to a file) or fall
+ * back to a recency+stride heuristic.  A real on-DSV4 self-score path needs
+ * shallow-prefill Metal kernels and is intentionally out of scope here.
+ *
+ * AGENT.md note: this is a diagnostic / experimental switch, not a permanent
+ * release-path semantic variant.  It exists to validate the dense-prefill
+ * compression flow end-to-end against the anemll reference harness, and to
+ * let local agent sessions opt into smaller prefills on long prompts. */
+typedef struct {
+    /* Fraction of history chunks to keep, in (0, 1].  1.0 disables selection
+     * (returns prompt unchanged).  Default 0.3. */
+    float keep_pct;
+
+    /* Number of trailing prompt tokens to always include in the compressed
+     * output regardless of score.  Preserves chat-template tail (im_end /
+     * assistant prefix etc).  Default 256.  Clamped to prompt length. */
+    int tail_size;
+
+    /* Tokens per chunk for chunk-wise selection.  Default 32. */
+    int chunk_size;
+
+    /* Optional per-prompt-token importance scores.  When non-NULL, must have
+     * exactly `prompt->len` entries.  Higher = more important. */
+    const float *scores;
+    int scores_len;
+
+    /* When true and `scores` is NULL, ds4_spec_prefill_compress calls
+     * ds4_engine_score_prompt() to compute attention-based scores natively.
+     * Requires CPU backend in v1 (the engine returns an error otherwise).
+     * When both `self_score = false` and `scores = NULL`, the function
+     * falls back to a recency-only heuristic. */
+    bool self_score;
+
+    /* Scoring knobs, only consulted when self_score = true.  Zero values
+     * mean "use defaults": score_layers=2, score_lookahead=4, pool_kernel=13. */
+    int  score_layers;
+    int  score_lookahead;
+    int  score_pool_kernel;
+} ds4_spec_prefill_options;
+
+/* Diagnostic / test helper.  Runs both the CPU and the graph-backend
+ * (Metal/CUDA) scorers over the same model + prompt and reports the
+ * max-abs-diff between their outputs.  Only the active engine backend's
+ * graph runtime is required to be initialized -- the CPU scorer is
+ * always available regardless of which backend the engine was opened on
+ * because it reads model->weights directly.
+ *
+ * Useful for validating the Metal composition matches the CPU reference
+ * (the underlying ds4_gpu_* primitives have their own unit tests; this
+ * checks that the scorer puts them together in the right order with the
+ * right shapes/offsets).  Each output buffer must have at least
+ * `prompt->len` floats.  Returns 0 on success. */
+int ds4_engine_score_prompt_validate(
+        ds4_engine *e,
+        const ds4_tokens *prompt,
+        int score_layers,
+        int score_lookahead,
+        int pool_kernel,
+        float *scores_cpu_out,
+        float *scores_graph_out,
+        float *max_abs_diff_out,
+        char *err, size_t errlen);
+
+/* Per-prompt-token attention-aggregation scoring against the loaded DSV4
+ * model itself, on the CPU reference backend.  Algorithm mirrors the
+ * SpecPrefill paper (and the mlx-lm port at the Python layer):
+ *
+ *   for layer in first `score_layers` attention layers:
+ *       compute Q for every prompt position via the LoRA-projected MLA Q
+ *           path (q_a -> q_a_norm -> q_b -> head_rms_norm -> RoPE)
+ *       compute K_latent for every prompt position via the MLA K path
+ *           (attn_kv -> kv_a_norm -> RoPE)
+ *       use the last `score_lookahead` prompt rows as lookahead queries
+ *           and compute softmax(Q[m] dot K[<=m]) / sqrt(head_dim)
+ *           per (layer, head)
+ *   smooth each row with a centered avg-pool of width pool_kernel
+ *   take max across (layer, head)
+ *   take mean across lookahead rows
+ *
+ * The CPU scorer reuses the existing CPU helpers (embed_token_f16,
+ * hc_pre_norm_batch, matmul_q8_0_batch, head_rms_norm_inplace,
+ * rope_tail_layer_inplace).  The Metal/CUDA scorer reuses the equivalent
+ * ds4_gpu_* primitives the real prefill graph uses (embed_tokens,
+ * matmul_q8_0_tensor, dsv4_qkv_rms_norm_rows, head_rms_norm,
+ * rope_tail_tensor), so the math stays in lockstep with prefill on every
+ * backend.  Both scorers deliberately skip the indexer, the KV
+ * compressor, FFN, MoE routing, and any layer past `score_layers` --
+ * scoring is a cheap diagnostic, not a full prefill.
+ *
+ * `scores_out` must point to at least `prompt->len` floats.  Returns 0
+ * on success.  Backend dispatch is automatic: CPU engines run the CPU
+ * path, Metal/CUDA engines run the GPU path. */
+int ds4_engine_score_prompt(
+        ds4_engine *e,
+        const ds4_tokens *prompt,
+        int score_layers,
+        int score_lookahead,
+        int pool_kernel,
+        float *scores_out,
+        char *err, size_t errlen);
+
+/* Compute a sensible default-options block.  Caller can then override any
+ * field before passing it to ds4_spec_prefill_compress. */
+ds4_spec_prefill_options ds4_spec_prefill_options_default(void);
+
+/* Compress a prompt down to (selected history chunks ∪ recent tail).  Token
+ * order is preserved (sorted by original index).  Caller owns `out` and must
+ * ds4_tokens_free it.  Returns 0 on success. */
+int ds4_spec_prefill_compress(
+        ds4_engine *e,
+        const ds4_tokens *prompt,
+        const ds4_spec_prefill_options *opt,
+        ds4_tokens *out,
+        char *err, size_t errlen);
+
+/* Convenience: parse a whitespace-separated float-per-line scores file into a
+ * heap-allocated float buffer.  `*out_scores` is malloc'd and the caller
+ * must free it.  Returns 0 on success.  Errors include unreadable file,
+ * non-numeric content, and short/long token counts when `expected_len > 0`. */
+int ds4_spec_prefill_load_scores_file(
+        const char *path,
+        int expected_len,
+        float **out_scores,
+        int *out_len,
+        char *err, size_t errlen);
+
 /* Disk KV payload helpers.  HTTP/agent code owns the outer file header and
  * persistence policy; the engine owns the DS4-specific serialized graph state. */
 uint64_t ds4_session_payload_bytes(ds4_session *s);

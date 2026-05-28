@@ -614,6 +614,102 @@ static void test_long_prefill_progress(void *ud, const char *event, int current,
     }
 }
 
+/* CPU/Metal (or CPU/CUDA) parity test for ds4_engine_score_prompt's two
+ * backends.  The active engine is graph-backend (Metal on Darwin, CUDA
+ * elsewhere); both score paths read model->weights directly, so we run
+ * both over the same prompt and check that the per-token importance
+ * vectors agree within an f16-tolerable bound.
+ *
+ * Tolerance defaults to 0.05 absolute (score values are bounded in
+ * roughly [0, 1] after pooling and the comparison is across attention
+ * softmax outputs through 2 layers, so this gives healthy margin while
+ * still catching real composition bugs).  Override via
+ * DS4_SCORE_PARITY_TOL=<float>. */
+static void test_spec_prefill_parity(void) {
+    ds4_engine *engine = test_get_engine(false);
+    TEST_ASSERT(engine != NULL);
+    if (!engine) return;
+
+    /* Source of truth for the prompt:
+     *   DS4_SCORE_PARITY_PROMPT=FILE -- a pre-rendered chat prompt file
+     *                                   (must start with the DSV4 BOS
+     *                                   marker; format matches the
+     *                                   long-context-story fixture).
+     *   otherwise, build a short internal user message.
+     * Scoring knobs:
+     *   DS4_SCORE_PARITY_LAYERS    (int, default 2)
+     *   DS4_SCORE_PARITY_LOOKAHEAD (int, default 4)
+     *   DS4_SCORE_PARITY_TOL       (float, default 0.05). */
+    ds4_tokens prompt = {0};
+    const char *prompt_path = getenv("DS4_SCORE_PARITY_PROMPT");
+    char *prompt_text = NULL;
+    if (prompt_path && prompt_path[0]) {
+        prompt_text = test_read_file(prompt_path);
+        TEST_ASSERT(prompt_text != NULL);
+        if (!prompt_text) return;
+        ds4_tokenize_rendered_chat(engine, prompt_text, &prompt);
+    } else {
+        ds4_chat_begin(engine, &prompt);
+        ds4_chat_append_message(engine, &prompt, "user",
+                "Summarise the main points of the following design document in three bullets.");
+        ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+    }
+    TEST_ASSERT(prompt.len > 4);
+    if (prompt.len <= 4) {
+        free(prompt_text); ds4_tokens_free(&prompt);
+        return;
+    }
+
+    int score_layers = 2;
+    int score_lookahead = 4;
+    const char *e_l = getenv("DS4_SCORE_PARITY_LAYERS");
+    const char *e_la = getenv("DS4_SCORE_PARITY_LOOKAHEAD");
+    if (e_l  && e_l[0])  score_layers    = (int)strtol(e_l,  NULL, 10);
+    if (e_la && e_la[0]) score_lookahead = (int)strtol(e_la, NULL, 10);
+    if (score_layers    < 1) score_layers    = 2;
+    if (score_lookahead < 1) score_lookahead = 4;
+
+    float *scores_cpu   = malloc((size_t)prompt.len * sizeof(float));
+    float *scores_graph = malloc((size_t)prompt.len * sizeof(float));
+    TEST_ASSERT(scores_cpu && scores_graph);
+    if (!scores_cpu || !scores_graph) {
+        free(scores_cpu); free(scores_graph);
+        free(prompt_text); ds4_tokens_free(&prompt);
+        return;
+    }
+
+    float max_abs = 0.0f;
+    char err[256] = {0};
+    const double t0 = now_sec();
+    int rc = ds4_engine_score_prompt_validate(
+            engine, &prompt,
+            score_layers, score_lookahead, 13,
+            scores_cpu, scores_graph,
+            &max_abs, err, sizeof(err));
+    const double dt = now_sec() - t0;
+    if (rc != 0) {
+        fprintf(stderr, "spec-prefill parity: %s\n", err);
+    }
+    TEST_ASSERT(rc == 0);
+
+    float tol = 0.05f;
+    const char *tol_env = getenv("DS4_SCORE_PARITY_TOL");
+    if (tol_env && tol_env[0]) {
+        float v = strtof(tol_env, NULL);
+        if (v > 0.0f && isfinite(v)) tol = v;
+    }
+    fprintf(stderr,
+            "spec-prefill parity: n=%d layers=%d lookahead=%d "
+            "max|graph-cpu|=%.6f tol=%.4f wall=%.2fs\n",
+            prompt.len, score_layers, score_lookahead, max_abs, tol, dt);
+    TEST_ASSERT(max_abs < tol);
+
+    free(scores_cpu);
+    free(scores_graph);
+    free(prompt_text);
+    ds4_tokens_free(&prompt);
+}
+
 static void test_long_story_fact_recall(void) {
     const char *prompt_path = getenv("DS4_TEST_LONG_PROMPT");
     if (!prompt_path || !prompt_path[0]) {
@@ -1389,6 +1485,195 @@ static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
 
+/* Speculative prefill (dense-decode variant) unit tests.
+ *
+ * Exercises ds4_spec_prefill_compress in isolation against a synthetic
+ * prompt.  Does not require a model file: the function is a pure prompt
+ * preprocessor.  Validates: tail preservation, monotone index ordering,
+ * keep_pct = 1.0 passthrough, score-overrides-recency, and chunk-size /
+ * tail-size edge cases that the harness (anemll-project's
+ * specprefill.select_chunks) was observed to handle. */
+static void test_spec_prefill_unit(void) {
+    /* Synthetic prompt: 1024 tokens, ID == position so we can verify ordering. */
+    enum { N = 1024 };
+    ds4_tokens prompt = {0};
+    for (int i = 0; i < N; i++) ds4_tokens_push(&prompt, i);
+
+    /* Case 1: tail-only preservation when keep_pct is very low.
+     * With keep_pct = 0.01 and chunk_size = 32, only 1 history chunk should
+     * survive; tail of 256 tokens is always kept. */
+    {
+        ds4_spec_prefill_options o = ds4_spec_prefill_options_default();
+        o.keep_pct = 0.01f;
+        o.tail_size = 256;
+        o.chunk_size = 32;
+        ds4_tokens out = {0};
+        char err[256];
+        TEST_ASSERT(ds4_spec_prefill_compress(NULL, &prompt, &o, &out, err, sizeof(err)) == 0);
+        /* History length = N - tail = 768; chunks = ceil(768/32) = 24;
+         * keep_n = ceil(24 * 0.01) = 1 chunk = 32 tokens.  Plus tail 256. */
+        TEST_ASSERT(out.len == 32 + 256);
+        /* Last 256 of out must be the last 256 of prompt, in order. */
+        for (int i = 0; i < 256; i++) {
+            TEST_ASSERT(out.v[out.len - 256 + i] == prompt.v[N - 256 + i]);
+        }
+        /* Output indices must be strictly ascending (we preserve order). */
+        for (int i = 1; i < out.len; i++) {
+            TEST_ASSERT(out.v[i] > out.v[i - 1]);
+        }
+        ds4_tokens_free(&out);
+    }
+
+    /* Case 2: keep_pct = 1.0 short-circuits to passthrough. */
+    {
+        ds4_spec_prefill_options o = ds4_spec_prefill_options_default();
+        o.keep_pct = 1.0f;
+        ds4_tokens out = {0};
+        char err[256];
+        TEST_ASSERT(ds4_spec_prefill_compress(NULL, &prompt, &o, &out, err, sizeof(err)) == 0);
+        TEST_ASSERT(out.len == N);
+        for (int i = 0; i < N; i++) TEST_ASSERT(out.v[i] == i);
+        ds4_tokens_free(&out);
+    }
+
+    /* Case 3: short prompt entirely inside tail returns prompt unchanged. */
+    {
+        ds4_tokens short_prompt = {0};
+        for (int i = 0; i < 100; i++) ds4_tokens_push(&short_prompt, 1000 + i);
+        ds4_spec_prefill_options o = ds4_spec_prefill_options_default();
+        o.keep_pct = 0.3f;
+        o.tail_size = 256;
+        ds4_tokens out = {0};
+        char err[256];
+        TEST_ASSERT(ds4_spec_prefill_compress(NULL, &short_prompt, &o, &out, err, sizeof(err)) == 0);
+        TEST_ASSERT(out.len == 100);
+        for (int i = 0; i < 100; i++) TEST_ASSERT(out.v[i] == 1000 + i);
+        ds4_tokens_free(&out);
+        ds4_tokens_free(&short_prompt);
+    }
+
+    /* Case 4: caller-provided scores override the recency heuristic.
+     * Push importance into a single chunk far from the tail and verify it
+     * is the one that gets kept. */
+    {
+        const int TAIL = 64;
+        const int CHUNK = 32;
+        ds4_spec_prefill_options o = ds4_spec_prefill_options_default();
+        o.keep_pct = 0.05f;          /* keep ~1 history chunk */
+        o.tail_size = TAIL;
+        o.chunk_size = CHUNK;
+        float scores[N];
+        for (int i = 0; i < N; i++) scores[i] = 0.0f;
+        /* Mark tokens 100..131 (chunk index 100/32 == 3) as highly important. */
+        for (int i = 100; i < 132; i++) scores[i] = 10.0f;
+        o.scores = scores;
+        o.scores_len = N;
+
+        ds4_tokens out = {0};
+        char err[256];
+        TEST_ASSERT(ds4_spec_prefill_compress(NULL, &prompt, &o, &out, err, sizeof(err)) == 0);
+        /* History length 960, chunks ceil(960/32)=30, keep_n=ceil(30*0.05)=2.
+         * The 2 top-scored chunks should be chunk 3 (positions 96..127, mean
+         * ~28*10/32 = 8.75) and chunk 4 (positions 128..159, mean ~4*10/32 =
+         * 1.25).  Any other chunk has mean 0. */
+        TEST_ASSERT(out.len == 2 * CHUNK + TAIL);
+        /* First emitted history chunk should start at token 96 (chunk 3). */
+        TEST_ASSERT(out.v[0] == 96);
+        TEST_ASSERT(out.v[CHUNK] == 128);
+        /* Tail is the last TAIL tokens of prompt. */
+        for (int i = 0; i < TAIL; i++) {
+            TEST_ASSERT(out.v[out.len - TAIL + i] == prompt.v[N - TAIL + i]);
+        }
+        ds4_tokens_free(&out);
+    }
+
+    /* Case 5: bad scores_len rejected. */
+    {
+        ds4_spec_prefill_options o = ds4_spec_prefill_options_default();
+        o.keep_pct = 0.3f;
+        float scores[8] = {0};
+        o.scores = scores;
+        o.scores_len = 8;  /* != prompt->len */
+        ds4_tokens out = {0};
+        char err[256];
+        int rc = ds4_spec_prefill_compress(NULL, &prompt, &o, &out, err, sizeof(err));
+        TEST_ASSERT(rc != 0);
+        TEST_ASSERT(strstr(err, "scores_len") != NULL);
+        ds4_tokens_free(&out);
+    }
+
+    /* Case 6: keep_pct <= 0 rejected. */
+    {
+        ds4_spec_prefill_options o = ds4_spec_prefill_options_default();
+        o.keep_pct = 0.0f;
+        ds4_tokens out = {0};
+        char err[256];
+        int rc = ds4_spec_prefill_compress(NULL, &prompt, &o, &out, err, sizeof(err));
+        TEST_ASSERT(rc != 0);
+        ds4_tokens_free(&out);
+    }
+
+    /* Case 6b: self_score with NULL engine errors cleanly (defensive guard
+     * for callers passing the wrong engine pointer). */
+    {
+        ds4_spec_prefill_options o = ds4_spec_prefill_options_default();
+        o.keep_pct = 0.3f;
+        o.self_score = true;
+        ds4_tokens out = {0};
+        char err[256];
+        int rc = ds4_spec_prefill_compress(NULL, &prompt, &o, &out, err, sizeof(err));
+        TEST_ASSERT(rc != 0);
+        TEST_ASSERT(strstr(err, "engine") != NULL);
+        ds4_tokens_free(&out);
+    }
+
+    /* Case 6c: defaults helper sets the new self-score knobs. */
+    {
+        ds4_spec_prefill_options o = ds4_spec_prefill_options_default();
+        TEST_ASSERT(o.self_score == false);
+        TEST_ASSERT(o.score_layers == 2);
+        TEST_ASSERT(o.score_lookahead == 4);
+        TEST_ASSERT(o.score_pool_kernel == 13);
+    }
+
+    /* Case 7: scores file loader round-trip. */
+    {
+        char path[] = "/tmp/ds4_specprefill_scores_XXXXXX.txt";
+        /* mkstemp on the suffix-bearing template; mkstemps needs offset to the
+         * fixed suffix.  For portability use a plain tmp filename via tmpnam-
+         * style construction.  But the codebase prefers plain fopen/POSIX. */
+        snprintf(path, sizeof(path), "/tmp/ds4_specprefill_scores_%d.txt", (int)getpid());
+        FILE *fp = fopen(path, "w");
+        TEST_ASSERT(fp != NULL);
+        for (int i = 0; i < 16; i++) fprintf(fp, "%.3f\n", (float)i * 0.1f);
+        fclose(fp);
+        float *loaded = NULL;
+        int loaded_len = 0;
+        char err[256];
+        int rc = ds4_spec_prefill_load_scores_file(path, 16, &loaded, &loaded_len, err, sizeof(err));
+        TEST_ASSERT(rc == 0);
+        TEST_ASSERT(loaded_len == 16);
+        for (int i = 0; i < 16; i++) {
+            TEST_ASSERT(fabsf(loaded[i] - (float)i * 0.1f) < 1e-4f);
+        }
+        free(loaded);
+        unlink(path);
+
+        /* expected_len mismatch should error. */
+        snprintf(path, sizeof(path), "/tmp/ds4_specprefill_scores_%d.txt", (int)getpid());
+        fp = fopen(path, "w");
+        TEST_ASSERT(fp != NULL);
+        for (int i = 0; i < 8; i++) fprintf(fp, "%.3f ", (float)i);
+        fclose(fp);
+        rc = ds4_spec_prefill_load_scores_file(path, 16, &loaded, &loaded_len, err, sizeof(err));
+        TEST_ASSERT(rc != 0);
+        TEST_ASSERT(strstr(err, "16") != NULL);
+        unlink(path);
+    }
+
+    ds4_tokens_free(&prompt);
+}
+
 typedef void (*test_fn)(void);
 
 typedef struct {
@@ -1400,6 +1685,7 @@ typedef struct {
 
 static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
+    {"--spec-prefill-parity", "spec-prefill-parity", "CPU vs graph backend numerical parity for ds4_engine_score_prompt", test_spec_prefill_parity},
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard Metal path", test_official_logprob_vectors},
@@ -1408,6 +1694,7 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
+    {"--spec-prefill", "spec-prefill", "speculative prefill prompt compression unit tests", test_spec_prefill_unit},
 };
 
 static void test_print_help(const char *prog) {
