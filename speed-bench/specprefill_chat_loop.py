@@ -48,7 +48,7 @@ import sys
 import tempfile
 import time
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 # linenoise (ds4's REPL line editor) chokes on huge single-line inputs
@@ -784,6 +784,36 @@ def write_csv(metrics: list[TurnMetrics], out_path: Path) -> None:
             w.writerow([getattr(m, f) for f in fields])
 
 
+def read_metrics_csv(path: Path) -> list[TurnMetrics]:
+    int_fields = {
+        "depth", "turn", "prompt_tokens", "compressed_tokens",
+        "canonical_tokens", "sync_tokens", "suffix_tokens",
+        "ctx_session_tokens", "ctx_limit", "ctx_remaining", "transcript_tokens",
+    }
+    float_fields = {
+        "prefill_tps", "gen_tps", "wall_s", "ttft_ms", "drafter_ms",
+        "compress_ms", "target_prefill_ms", "first_decode_ms",
+        "effective_prompt_tps", "target_prefill_tps", "drafter_tps",
+        "validate_max_abs", "validate_rms",
+    }
+    known_fields = {f.name for f in fields(TurnMetrics)}
+    metrics: list[TurnMetrics] = []
+    with path.open(newline="") as fp:
+        for row in csv.DictReader(fp):
+            kwargs = {}
+            for key, raw_value in row.items():
+                if key not in known_fields:
+                    continue
+                value = raw_value if raw_value != "" else None
+                if value is not None and key in int_fields:
+                    value = int(value)
+                elif value is not None and key in float_fields:
+                    value = float(value)
+                kwargs[key] = value
+            metrics.append(TurnMetrics(**kwargs))
+    return metrics
+
+
 def write_needle_csv(rows: list[dict[str, object]], out_path: Path) -> None:
     fields = [
         "mode", "depth", "recall_exact", "has_phrase", "has_code",
@@ -810,7 +840,7 @@ def maybe_plot(metrics: list[TurnMetrics], out_dir: Path) -> bool:
     modes = sorted({m.mode for m in metrics})
 
     def x_context(m: TurnMetrics) -> int:
-        return m.canonical_tokens or m.prompt_tokens or m.turn
+        return m.transcript_tokens or m.canonical_tokens or m.prompt_tokens or m.turn
 
     def plot_value(m: TurnMetrics, attr: str):
         if attr == "effective_prompt_tps":
@@ -842,7 +872,7 @@ def maybe_plot(metrics: list[TurnMetrics], out_dir: Path) -> bool:
             if not ys:
                 continue
             ax.plot(xs, ys, marker="o", label=mode)
-        ax.set_xlabel("Canonical context tokens before generation")
+        ax.set_xlabel("Total logical context tokens after turn")
         ax.set_ylabel(title)
         ax.set_title(f"{title} ({hint})")
         ax.legend(loc="best")
@@ -866,7 +896,7 @@ def maybe_plot(metrics: list[TurnMetrics], out_dir: Path) -> bool:
             if not ys:
                 continue
             ax.plot(xs, ys, marker="o", label=mode)
-        ax.set_xlabel("Canonical context tokens before generation")
+        ax.set_xlabel("Total logical context tokens after turn")
         ax.set_ylabel("max | metal-cpu |")
         ax.set_title("CPU vs Metal scorer parity per turn (lower is better)")
         ax.legend(loc="best")
@@ -889,7 +919,7 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
     by_mode_turn = {(m.mode, m.turn): m for m in rows}
 
     def x_context(m: TurnMetrics) -> int:
-        return m.canonical_tokens or m.prompt_tokens or m.turn
+        return m.transcript_tokens or m.canonical_tokens or m.prompt_tokens or m.turn
 
     def chart_value(m: TurnMetrics, attr: str):
         if attr == "effective_prompt_tps":
@@ -910,13 +940,11 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        fig, axes = plt.subplots(4, 1, figsize=(8.5, 11.0), dpi=140, sharex=True)
+        fig, axes = plt.subplots(3, 1, figsize=(8.5, 9.0), dpi=140, sharex=True)
         specs = [
+            ("gen_tps", "Decode tok/s"),
             ("ttft_ms", "Chat TTFT ms"),
             ("wall_s", "Full turn wall time s"),
-            ("effective_prompt_tps", "Effective full-context tok/s"),
-            ("target_prefill_tps", "Target/suffix prefill tok/s"),
-            ("gen_tps", "Decode tok/s"),
         ]
         for ax, (attr, ylabel) in zip(axes, specs):
             for mode in modes:
@@ -931,7 +959,7 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
                     ax.plot(xs, ys, marker="o", label=mode)
             ax.set_ylabel(ylabel)
             ax.grid(True, alpha=0.3)
-        axes[-1].set_xlabel("Canonical context tokens before generation")
+        axes[-1].set_xlabel("Total logical context tokens after turn")
         axes[0].set_title(title)
         axes[0].legend(loc="best")
         fig.tight_layout()
@@ -948,35 +976,39 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
         "",
         "Generated by `speed-bench/specprefill_chat_loop.py`.",
         "",
+        "Real chat-loop test: both modes ran the same prompt sequence while the",
+        "logical conversation context grew. This is an actual-usage comparison,",
+        "not a cold-prefill sweep at each context length.",
+        "",
         "## Measurement Definitions",
         "",
-        "- `effective prompt tok/s` = canonical prompt tokens / TTFT.",
+        "- `ctx` = total logical chat context tokens after the turn.",
+        "- `target ctx` = DS4 target KV/session tokens after the turn; for SpecPrefill this is compressed.",
         "- `TTFT` = chat turn start to first emitted token; DS4 breakdown includes drafter, compression, target prefill, and first decode.",
         "- `wall time` = full scripted turn time, including the complete generated response.",
-        "- `target prefill tok/s` = actual synced suffix tokens / target prefill time.",
         "- `decode tok/s` = emitted tokens / decode elapsed after prefill.",
-        "- `ctx` is target KV/session tokens when available; `transcript` is canonical chat tokens.",
-        "- Chart x-axis is canonical prompt/context tokens before generation, not turn index.",
-        "- Baseline follow-up TTFT is warm-continuation TTFT: the full transcript is already resident in KV and only the suffix is synced.",
-        "- Baseline follow-up `effective prompt tok/s` is omitted from the chart because baseline reuses KV and only prefills the suffix; dividing full canonical context by warm TTFT is not an actual prefill rate.",
+        "- Chart x-axis is total logical context tokens, matching the mini-01 Qwen revalidation style.",
+        "- Baseline follow-up TTFT is warm-continuation TTFT: the prior context is resident in KV and only the new suffix is synced.",
         "",
         "## Per-Turn Measurements",
         "",
     ]
-    header = ["turn"]
-    for mode in modes:
-        header += [
-            f"{mode} prompt ctx",
-            f"{mode} transcript",
-            f"{mode} ctx",
-            f"{mode} sync",
-            f"{mode} suffix",
-            f"{mode} eff tok/s",
-            f"{mode} TTFT ms",
-            f"{mode} wall s",
-            f"{mode} target tok/s",
-            f"{mode} decode tok/s",
-        ]
+    base_label = modes[0] if modes else "baseline"
+    sp_label = modes[1] if len(modes) > 1 else (modes[0] if modes else "specprefill")
+    header = [
+        "turn",
+        f"{base_label} ctx",
+        f"{base_label} target ctx",
+        f"{base_label} TTFT ms",
+        f"{base_label} wall s",
+        f"{base_label} decode tok/s",
+        f"{sp_label} ctx",
+        f"{sp_label} target ctx",
+        f"{sp_label} compressed",
+        f"{sp_label} TTFT ms",
+        f"{sp_label} wall s",
+        f"{sp_label} decode tok/s",
+    ]
     lines.append("| " + " | ".join(header) + " |")
     lines.append("|" + "|".join(["---:"] * len(header)) + "|")
 
@@ -988,21 +1020,22 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
         return f"{value:.{digits}f}"
 
     for turn in turns:
-        row = [str(turn + 1)]
-        for mode in modes:
-            m = by_mode_turn.get((mode, turn))
-            row += [
-                fmt(m.canonical_tokens if m else None, 0),
-                fmt(m.transcript_tokens if m else None, 0),
-                fmt(m.ctx_session_tokens if m else None, 0),
-                fmt(m.sync_tokens if m else None, 0),
-                fmt(m.suffix_tokens if m else None, 0),
-                fmt(m.effective_prompt_tps if m else None),
-                fmt(m.ttft_ms if m else None),
-                fmt(m.wall_s if m else None),
-                fmt(m.target_prefill_tps if m else None),
-                fmt(m.gen_tps if m else None),
-            ]
+        base = by_mode_turn.get((base_label, turn))
+        sp = by_mode_turn.get((sp_label, turn))
+        row = [
+            str(turn + 1),
+            fmt(base.transcript_tokens if base else None, 0),
+            fmt(base.ctx_session_tokens if base else None, 0),
+            fmt(base.ttft_ms if base else None),
+            fmt(base.wall_s if base else None),
+            fmt(base.gen_tps if base else None),
+            fmt(sp.transcript_tokens if sp else None, 0),
+            fmt(sp.ctx_session_tokens if sp else None, 0),
+            fmt(sp.compressed_tokens if sp else None, 0),
+            fmt(sp.ttft_ms if sp else None),
+            fmt(sp.wall_s if sp else None),
+            fmt(sp.gen_tps if sp else None),
+        ]
         lines.append("| " + " | ".join(row) + " |")
 
     if plotted:
@@ -1011,9 +1044,9 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
         "",
         "## Notes",
         "",
-        "- DS4 baseline REPL keeps a live KV session and may only prefill the new suffix on follow-up turns.",
+        "- DS4 baseline REPL keeps the full live KV session and only syncs new suffix tokens on follow-up turns.",
         "- SpecPrefill `fresh` mode recompresses the full canonical transcript each turn, then syncs the compressed target view.",
-        "- Use the TTFT breakdown columns in `metrics.csv` to separate drafter/scoring cost from target distributed prefill cost.",
+        "- Use `metrics.csv` for the TTFT breakdown columns (`drafter_ms`, `target_prefill_ms`, `first_decode_ms`) and suffix/sync counts.",
         "",
     ]
     md_path.write_text("\n".join(lines), encoding="utf-8")
@@ -1122,11 +1155,24 @@ def main() -> int:
     ap.add_argument("--timeout", type=int, default=1800,
                     help="Per-mode subprocess timeout in seconds (default 30 min)")
     ap.add_argument("--out-dir", default="/tmp/ds4_chatloop")
+    ap.add_argument("--report-only-metrics",
+                    help="Read an existing metrics.csv and regenerate plots/report without running ds4.")
     ap.add_argument("--no-plot", action="store_true")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.report_only_metrics:
+        all_metrics = read_metrics_csv(Path(args.report_only_metrics))
+        if not args.no_plot:
+            maybe_plot(all_metrics, out_dir)
+            write_comparison_report(
+                all_metrics,
+                out_dir,
+                "DS4 distributed chat-loop comparison — baseline vs SpecPrefill drafter",
+            )
+        return 0
 
     if args.external_score_only:
         depths = [int(x.strip()) for x in args.needle_depths.split(",") if x.strip()] if args.needle_depths else [0]
