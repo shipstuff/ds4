@@ -876,6 +876,18 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
     turns = sorted({m.turn for m in rows})
     by_mode_turn = {(m.mode, m.turn): m for m in rows}
 
+    def chart_value(m: TurnMetrics, attr: str):
+        if attr == "effective_prompt_tps":
+            # Baseline follow-up turns reuse KV and only prefill the suffix.
+            # canonical_tokens / TTFT is useful for a cold prompt, but it is
+            # misleading for warm baseline turns because canonical_tokens
+            # includes already-resident context.
+            if (m.mode == "baseline" and m.suffix_tokens is not None and
+                    m.canonical_tokens is not None and
+                    m.suffix_tokens != m.canonical_tokens):
+                return None
+        return getattr(m, attr)
+
     png_name = "chat_baseline_vs_specprefill.png"
     png_path = out_dir / png_name
     plotted = False
@@ -883,18 +895,19 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        fig, axes = plt.subplots(3, 1, figsize=(8.5, 9.0), dpi=140, sharex=True)
+        fig, axes = plt.subplots(4, 1, figsize=(8.5, 11.0), dpi=140, sharex=True)
         specs = [
-            ("effective_prompt_tps", "Effective prompt tok/s"),
-            ("gen_tps", "Decode tok/s"),
             ("ttft_ms", "TTFT ms"),
+            ("effective_prompt_tps", "Effective full-context tok/s"),
+            ("target_prefill_tps", "Target/suffix prefill tok/s"),
+            ("gen_tps", "Decode tok/s"),
         ]
         for ax, (attr, ylabel) in zip(axes, specs):
             for mode in modes:
                 xs, ys = [], []
                 for turn in turns:
                     m = by_mode_turn.get((mode, turn))
-                    y = getattr(m, attr) if m else None
+                    y = chart_value(m, attr) if m else None
                     if y is not None:
                         xs.append(turn + 1)
                         ys.append(y)
@@ -926,6 +939,7 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
         "- `target prefill tok/s` = actual synced suffix tokens / target prefill time.",
         "- `decode tok/s` = emitted tokens / decode elapsed after prefill.",
         "- `ctx` is target KV/session tokens when available; `transcript` is canonical chat tokens.",
+        "- Baseline follow-up `effective prompt tok/s` is omitted from the chart because baseline reuses KV and only prefills the suffix; dividing full canonical context by warm TTFT is not an actual prefill rate.",
         "",
         "## Per-Turn Measurements",
         "",
@@ -935,6 +949,8 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
         header += [
             f"{mode} transcript",
             f"{mode} ctx",
+            f"{mode} sync",
+            f"{mode} suffix",
             f"{mode} eff tok/s",
             f"{mode} TTFT ms",
             f"{mode} target tok/s",
@@ -957,6 +973,8 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
             row += [
                 fmt(m.transcript_tokens if m else None, 0),
                 fmt(m.ctx_session_tokens if m else None, 0),
+                fmt(m.sync_tokens if m else None, 0),
+                fmt(m.suffix_tokens if m else None, 0),
                 fmt(m.effective_prompt_tps if m else None),
                 fmt(m.ttft_ms if m else None),
                 fmt(m.target_prefill_tps if m else None),
