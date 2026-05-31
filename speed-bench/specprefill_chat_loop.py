@@ -912,7 +912,8 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
         import matplotlib.pyplot as plt
         fig, axes = plt.subplots(4, 1, figsize=(8.5, 11.0), dpi=140, sharex=True)
         specs = [
-            ("ttft_ms", "TTFT ms"),
+            ("ttft_ms", "Chat TTFT ms"),
+            ("wall_s", "Full turn wall time s"),
             ("effective_prompt_tps", "Effective full-context tok/s"),
             ("target_prefill_tps", "Target/suffix prefill tok/s"),
             ("gen_tps", "Decode tok/s"),
@@ -950,11 +951,13 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
         "## Measurement Definitions",
         "",
         "- `effective prompt tok/s` = canonical prompt tokens / TTFT.",
-        "- `TTFT` = turn start to first emitted token; DS4 breakdown includes drafter, compression, target prefill, and first decode.",
+        "- `TTFT` = chat turn start to first emitted token; DS4 breakdown includes drafter, compression, target prefill, and first decode.",
+        "- `wall time` = full scripted turn time, including the complete generated response.",
         "- `target prefill tok/s` = actual synced suffix tokens / target prefill time.",
         "- `decode tok/s` = emitted tokens / decode elapsed after prefill.",
         "- `ctx` is target KV/session tokens when available; `transcript` is canonical chat tokens.",
         "- Chart x-axis is canonical prompt/context tokens before generation, not turn index.",
+        "- Baseline follow-up TTFT is warm-continuation TTFT: the full transcript is already resident in KV and only the suffix is synced.",
         "- Baseline follow-up `effective prompt tok/s` is omitted from the chart because baseline reuses KV and only prefills the suffix; dividing full canonical context by warm TTFT is not an actual prefill rate.",
         "",
         "## Per-Turn Measurements",
@@ -970,6 +973,7 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
             f"{mode} suffix",
             f"{mode} eff tok/s",
             f"{mode} TTFT ms",
+            f"{mode} wall s",
             f"{mode} target tok/s",
             f"{mode} decode tok/s",
         ]
@@ -995,6 +999,7 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
                 fmt(m.suffix_tokens if m else None, 0),
                 fmt(m.effective_prompt_tps if m else None),
                 fmt(m.ttft_ms if m else None),
+                fmt(m.wall_s if m else None),
                 fmt(m.target_prefill_tps if m else None),
                 fmt(m.gen_tps if m else None),
             ]
