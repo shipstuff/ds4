@@ -395,6 +395,9 @@ struct ds4_dist_session {
     uint64_t plan_generation;
     uint64_t session_id;
     uint64_t request_id;
+    uint64_t token_hash;
+    uint32_t token_hash_len;
+    bool token_hash_valid;
 };
 
 typedef struct {
@@ -2575,6 +2578,7 @@ static int dist_coordinator_eval_span(
         uint64_t session_id,
         uint64_t request_id,
         bool reset_session,
+        const uint64_t *known_prefix_hash,
         float *logits,
         char *err,
         size_t errlen) {
@@ -2590,12 +2594,16 @@ static int dist_coordinator_eval_span(
             if (errlen) snprintf(err, errlen, "distributed reset span must start at position 0");
             return 1;
         }
-    } else if (dist_session_token_hash_prefix(session,
-                                              pos0,
-                                              &prefix_hash,
-                                              err,
-                                              errlen) != 0) {
-        return 1;
+    } else {
+        if (known_prefix_hash) {
+            prefix_hash = *known_prefix_hash;
+        } else if (dist_session_token_hash_prefix(session,
+                                                  pos0,
+                                                  &prefix_hash,
+                                                  err,
+                                                  errlen) != 0) {
+            return 1;
+        }
     }
     const uint64_t result_hash = dist_token_hash_update_span(prefix_hash, tokens, n_tokens);
     const uint32_t hidden_bytes = (uint32_t)hidden_bytes64;
@@ -2965,7 +2973,7 @@ static int dist_write_logprobs_dump(
         if (dist_coordinator_eval_span(state, session, plan,
                                        &token, 1, token_pos,
                                        session_id, (*request_id)++,
-                                       false, logits, err, sizeof(err)) != 0) {
+                                       false, NULL, logits, err, sizeof(err)) != 0) {
             fprintf(stderr,
                     "ds4: distributed decode failed while dumping logprobs: %s\n",
                     err);
@@ -3725,7 +3733,7 @@ static int dist_coordinator_prefill_prompt(
         int eval_rc = dist_coordinator_eval_span(state, session, plan,
                                                  prompt->v + pos, chunk, pos,
                                                  session_id, (*request_id)++,
-                                                 pos == 0, logits, err, errlen);
+                                                 pos == 0, NULL, logits, err, errlen);
         if (eval_rc != 0) {
             return eval_rc;
         }
@@ -3964,7 +3972,7 @@ static int dist_run_coordinator_generation(
         int decode_rc = dist_coordinator_eval_span(state, session, &plan,
                                                    &token, 1, token_pos,
                                                    session_id, request_id++,
-                                                   false, logits, err, sizeof(err));
+                                                   false, NULL, logits, err, sizeof(err));
         if (decode_rc != 0) {
             fprintf(stderr, "\nds4: distributed decode failed: %s\n", err);
             if (dist_coordinator_rebuild_from_transcript(state,
@@ -5451,6 +5459,7 @@ int ds4_dist_session_sync(
                                                                        err,
                                                                        errlen);
             if (prefill_rc != 0) {
+                d->token_hash_valid = false;
                 if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                              owner,
                                                              &d->plan,
@@ -5468,13 +5477,26 @@ int ds4_dist_session_sync(
                 }
                 d->plan_ready = true;
             }
+            d->token_hash = dist_token_hash_prefix(prompt->v, (uint32_t)prompt->len);
+            d->token_hash_len = (uint32_t)prompt->len;
+            d->token_hash_valid = true;
             return 0;
         }
 
         uint32_t pos = pos0;
+        uint64_t prefix_hash = 0;
+        bool prefix_hash_valid = false;
+        if (d->token_hash_valid && d->token_hash_len == pos0) {
+            prefix_hash = d->token_hash;
+            prefix_hash_valid = true;
+        }
         while (pos < (uint32_t)prompt->len) {
             const uint32_t remaining = (uint32_t)prompt->len - pos;
             const uint32_t chunk = remaining < chunk_cap ? remaining : chunk_cap;
+            if (!prefix_hash_valid) {
+                prefix_hash = dist_token_hash_prefix(prompt->v, pos);
+                prefix_hash_valid = true;
+            }
             int eval_rc = dist_coordinator_eval_span(&d->state,
                                                      owner,
                                                      &d->plan,
@@ -5484,10 +5506,12 @@ int ds4_dist_session_sync(
                                                      d->session_id,
                                                      d->request_id++,
                                                      false,
+                                                     &prefix_hash,
                                                      logits,
                                                      err,
                                                      errlen);
             if (eval_rc != 0) {
+                d->token_hash_valid = false;
                 if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                              owner,
                                                              &d->plan,
@@ -5504,8 +5528,15 @@ int ds4_dist_session_sync(
                     return 1;
                 }
                 d->plan_ready = true;
+                d->token_hash = dist_token_hash_prefix(prompt->v, (uint32_t)prompt->len);
+                d->token_hash_len = (uint32_t)prompt->len;
+                d->token_hash_valid = true;
                 return 0;
             }
+            prefix_hash = dist_token_hash_update_span(prefix_hash, prompt->v + pos, chunk);
+            d->token_hash = prefix_hash;
+            d->token_hash_len = pos + chunk;
+            d->token_hash_valid = true;
             pos += chunk;
             dist_report_prefill_progress(owner, pos, (uint32_t)prompt->len);
         }
@@ -5522,6 +5553,7 @@ int ds4_dist_session_sync(
                                                      err,
                                                      errlen);
     if (prefill_rc != 0) {
+        d->token_hash_valid = false;
         if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                      owner,
                                                      &d->plan,
@@ -5539,6 +5571,9 @@ int ds4_dist_session_sync(
         }
         d->plan_ready = true;
     }
+    d->token_hash = dist_token_hash_prefix(prompt->v, (uint32_t)prompt->len);
+    d->token_hash_len = (uint32_t)prompt->len;
+    d->token_hash_valid = true;
     return 0;
 }
 
@@ -5560,6 +5595,13 @@ int ds4_dist_session_eval(
     ds4_tokens_copy(&transcript, checkpoint);
     ds4_tokens_push(&transcript, token);
 
+    uint64_t prefix_hash = 0;
+    if (d->token_hash_valid && d->token_hash_len == (uint32_t)checkpoint->len) {
+        prefix_hash = d->token_hash;
+    } else {
+        prefix_hash = dist_token_hash_prefix(checkpoint->v, (uint32_t)checkpoint->len);
+    }
+
     int rc = dist_coordinator_eval_span(&d->state,
                                         owner,
                                         &d->plan,
@@ -5569,10 +5611,12 @@ int ds4_dist_session_eval(
                                         d->session_id,
                                         d->request_id++,
                                         false,
+                                        &prefix_hash,
                                         logits,
                                         err,
                                         errlen);
     if (rc != 0) {
+        d->token_hash_valid = false;
         if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                      owner,
                                                      &d->plan,
@@ -5591,7 +5635,12 @@ int ds4_dist_session_eval(
         }
         d->plan_ready = true;
         rc = 0;
+        d->token_hash = dist_token_hash_prefix(transcript.v, (uint32_t)transcript.len);
+    } else {
+        d->token_hash = dist_token_hash_update_span(prefix_hash, &token, 1);
     }
+    d->token_hash_len = (uint32_t)transcript.len;
+    d->token_hash_valid = true;
     ds4_tokens_free(&transcript);
     return rc;
 }

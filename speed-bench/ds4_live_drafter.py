@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import array
 import bisect
+import os
 import struct
 import sys
 import time
@@ -91,8 +92,8 @@ class FakeScorer:
 
 class MlxScorer:
     def __init__(self, args):
-        sys.path.insert(0, args.mlx_lm_dir)
-        sys.path.insert(0, args.specprefill_lib)
+        if args.mlx_lm_dir:
+            sys.path.insert(0, args.mlx_lm_dir)
 
         import mlx.core as mx  # noqa: PLC0415
         from mlx_lm import load  # noqa: PLC0415
@@ -177,9 +178,9 @@ def send_scores(scores, timings) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--scorer-model", required=True)
-    ap.add_argument("--dsv4-tokenizer", default="/Users/Shared/models/ds4-gguf/dsv4-tokenizer")
-    ap.add_argument("--specprefill-lib", default="/Users/carl/projects/anemll-project/scripts/heterogeneous")
-    ap.add_argument("--mlx-lm-dir", default="/Users/carl/projects/mlx-lm")
+    ap.add_argument("--dsv4-tokenizer", default="./gguf/dsv4-tokenizer")
+    ap.add_argument("--mlx-lm-dir",
+                    default=os.environ.get("MLX_LM_DIR", ""))
     ap.add_argument("--n-lookahead", type=int, default=4)
     ap.add_argument("--pool-kernel", type=int, default=13)
     ap.add_argument("--prefill-step-size", type=int, default=2048)

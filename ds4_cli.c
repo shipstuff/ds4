@@ -76,7 +76,6 @@ typedef struct {
     const char *spec_prefill_drafter_python;
     const char *spec_prefill_drafter_script;
     const char *spec_prefill_drafter_tokenizer;
-    const char *spec_prefill_drafter_lib;
     /* Native in-engine scoring (calls ds4_engine_score_prompt on the loaded
      * model).  CPU backend only in v1; the CLI falls back to the recency
      * heuristic on Metal/CUDA unless --spec-prefill-scores is supplied. */
@@ -297,13 +296,11 @@ static void usage(FILE *fp) {
         "      MLX/Qwen scorer helper and asks it for fresh scores at each\n"
         "      SpecPrefill compression. No heuristic fallback is used.\n"
         "  --spec-prefill-drafter-python PATH\n"
-        "      Python executable for the resident drafter helper. Default: /Users/carl/projects/anemll-project/env-anemll/bin/python.\n"
+        "      Python executable for the resident drafter helper. Default: python3.\n"
         "  --spec-prefill-drafter-script PATH\n"
         "      Helper script. Default: speed-bench/ds4_live_drafter.py.\n"
         "  --spec-prefill-drafter-tokenizer PATH\n"
-        "      DSV4 HF tokenizer directory. Default: /Users/Shared/models/ds4-gguf/dsv4-tokenizer.\n"
-        "  --spec-prefill-drafter-lib PATH\n"
-        "      Optional anemll specprefill_lib root for the helper.\n"
+        "      DSV4 HF tokenizer directory. Default: ./gguf/dsv4-tokenizer.\n"
         "  --spec-prefill-self-score\n"
         "      Score the prompt with ds4's own attention math (no external\n"
         "      draft).  Available on all backends; the scorer dispatches to\n"
@@ -1538,13 +1535,11 @@ static char *render_tokens_text(ds4_engine *engine, const ds4_tokens *tokens,
 static int cli_live_drafter_start(cli_config *cfg, char *err, size_t errlen) {
     if (cfg->drafter.pid > 0) return 0;
     const char *python = cfg->gen.spec_prefill_drafter_python ?
-        cfg->gen.spec_prefill_drafter_python : "/Users/carl/projects/anemll-project/env-anemll/bin/python";
+        cfg->gen.spec_prefill_drafter_python : "python3";
     const char *script = cfg->gen.spec_prefill_drafter_script ?
         cfg->gen.spec_prefill_drafter_script : "speed-bench/ds4_live_drafter.py";
     const char *tokenizer = cfg->gen.spec_prefill_drafter_tokenizer ?
-        cfg->gen.spec_prefill_drafter_tokenizer : "/Users/Shared/models/ds4-gguf/dsv4-tokenizer";
-    const char *lib = cfg->gen.spec_prefill_drafter_lib ?
-        cfg->gen.spec_prefill_drafter_lib : "/Users/carl/projects/anemll-project/scripts/heterogeneous";
+        cfg->gen.spec_prefill_drafter_tokenizer : "./gguf/dsv4-tokenizer";
     char lookahead_arg[32];
     char pool_arg[32];
     snprintf(lookahead_arg, sizeof(lookahead_arg), "%d", cfg->gen.spec_prefill_score_lookahead);
@@ -1571,7 +1566,6 @@ static int cli_live_drafter_start(cli_config *cfg, char *err, size_t errlen) {
         execlp(python, python, "-u", script,
                "--scorer-model", cfg->gen.spec_prefill_drafter_model,
                "--dsv4-tokenizer", tokenizer,
-               "--specprefill-lib", lib,
                "--n-lookahead", lookahead_arg,
                "--pool-kernel", pool_arg,
                (char *)NULL);
@@ -2289,10 +2283,9 @@ static cli_config parse_options(int argc, char **argv) {
             .spec_prefill_recompress_at_pct = 85,
             .spec_prefill_scores_path = NULL,
             .spec_prefill_drafter_model = NULL,
-            .spec_prefill_drafter_python = "/Users/carl/projects/anemll-project/env-anemll/bin/python",
+            .spec_prefill_drafter_python = "python3",
             .spec_prefill_drafter_script = "speed-bench/ds4_live_drafter.py",
-            .spec_prefill_drafter_tokenizer = "/Users/Shared/models/ds4-gguf/dsv4-tokenizer",
-            .spec_prefill_drafter_lib = "/Users/carl/projects/anemll-project/scripts/heterogeneous",
+            .spec_prefill_drafter_tokenizer = "./gguf/dsv4-tokenizer",
             .spec_prefill_self_score = false,
             .spec_prefill_score_layers = 2,
             .spec_prefill_score_lookahead = 4,
@@ -2477,8 +2470,6 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.spec_prefill_drafter_script = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--spec-prefill-drafter-tokenizer")) {
             c.gen.spec_prefill_drafter_tokenizer = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--spec-prefill-drafter-lib")) {
-            c.gen.spec_prefill_drafter_lib = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--spec-prefill-self-score")) {
             c.gen.spec_prefill_self_score = true;
             c.gen.spec_prefill_enabled = true;

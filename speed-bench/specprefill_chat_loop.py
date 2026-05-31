@@ -2,9 +2,8 @@
 """Drive ./ds4 through a scripted multi-turn chat, capture per-turn
 SpecPrefill / timing metrics, write a CSV, and plot the comparison.
 
-Designed for the SpecPrefill experimental flag added in
-`seslly/specprefill`.  Runs the same conversation under up to three
-modes (baseline / heuristic / self-score) and surfaces:
+Designed for the live-drafter SpecPrefill path. Runs the same conversation
+under baseline and drafter modes and surfaces:
 
   - per-turn prefill t/s and generation t/s (parsed from ds4's own
     DS4_LOG_TIMING line)
@@ -23,26 +22,22 @@ Quick start on a 96 GB+ Mac:
 
   python speed-bench/specprefill_chat_loop.py \\
       --model ./ds4flash.gguf \\
-      --modes baseline heuristic selfscore \\
-      --validate \\
+      --modes baseline drafter \\
+      --drafter-model ./gguf/qwen3.5-0.8b-mlx-4bit \\
       --out-dir /tmp/ds4_chatloop
 
-Without --validate the script does NOT touch DS4_SCORE_VALIDATE, so the
-runs are at full speed and you only get the CSV metrics + plots.
+Use --validate only when checking scorer parity; it enables DS4_SCORE_VALIDATE
+and slows the run.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
-import json
 import os
 import random
 import re
 import select
-import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -124,7 +119,6 @@ class TurnMetrics:
 class ModeRun:
     label: str
     args_extra: list[str] = field(default_factory=list)
-    needs_external_scores: bool = False
 
 
 SECRET_PHRASE = "Obsidian Falcon"
@@ -153,44 +147,6 @@ def build_modes(args) -> list[ModeRun]:
     modes: list[ModeRun] = []
     if "baseline" in args.modes:
         modes.append(ModeRun("baseline", []))
-    if "heuristic" in args.modes:
-        modes.append(ModeRun(
-            "heuristic",
-            [
-                f"--spec-prefill={args.keep_pct}",
-                "--spec-prefill-sink", str(args.sink),
-                "--spec-prefill-tail", str(args.tail),
-                "--spec-prefill-chunk", str(args.chunk),
-            ],
-        ))
-    if "selfscore" in args.modes:
-        modes.append(ModeRun(
-            "selfscore",
-            [
-                f"--spec-prefill={args.keep_pct}",
-                "--spec-prefill-sink", str(args.sink),
-                "--spec-prefill-tail", str(args.tail),
-                "--spec-prefill-chunk", str(args.chunk),
-                "--spec-prefill-self-score",
-                "--spec-prefill-score-layers", str(args.score_layers),
-                "--spec-prefill-score-lookahead", str(args.score_lookahead),
-            ],
-        ))
-    if "external" in args.modes:
-        modes.append(ModeRun(
-            "external",
-            [
-                f"--spec-prefill={args.keep_pct}",
-                "--spec-prefill-sink", str(args.sink),
-                "--spec-prefill-tail", str(args.tail),
-                "--spec-prefill-chunk", str(args.chunk),
-                # External score files are generated for the first cold prompt;
-                # keep this path reuse-only because it cannot score the larger
-                # generated transcript on later turns.
-                "--spec-prefill-cache", "reuse",
-            ],
-            needs_external_scores=True,
-        ))
     if "drafter" in args.modes:
         if not args.drafter_model:
             raise ValueError("--drafter-model is required for --modes drafter")
@@ -203,7 +159,6 @@ def build_modes(args) -> list[ModeRun]:
             "--spec-prefill-drafter-python", args.drafter_python,
             "--spec-prefill-drafter-script", args.drafter_script,
             "--spec-prefill-drafter-tokenizer", args.drafter_tokenizer,
-            "--spec-prefill-drafter-lib", args.drafter_lib,
         ]
         extra += ["--spec-prefill-cache", args.spec_prefill_cache]
         modes.append(ModeRun("drafter", extra))
@@ -313,189 +268,6 @@ def grade_needle_output(text: str) -> dict[str, object]:
         "seven_digits": " ".join(seven_digits),
         **metrics,
     }
-
-
-def generate_external_scores(args, turn: str, out_dir: Path, stem: str) -> Path:
-    """Generate a first-turn external score file for DS4 chat tokenization.
-
-    The external scorer works from raw user text, while DS4's chat loop scores
-    the rendered first-turn transcript:
-      BOS + user + content + assistant-prefix
-    In non-thinking REPL mode the generated needle prompt needs two special
-    tokens at the head and seven at the tail to match DS4's first-turn
-    transcript length.
-    """
-    if args.external_existing_scores_dir:
-        score_dir = Path(args.external_existing_scores_dir)
-        candidates = [score_dir / f"{stem}.scores.txt"]
-        if stem.startswith("external_"):
-            candidates.append(score_dir / f"{stem[len('external_'):]}.scores.txt")
-        for candidate in candidates:
-            if candidate.exists():
-                print(f"  external scores: reusing {candidate}", file=sys.stderr)
-                return candidate
-
-    if not args.external_scorer_model:
-        raise ValueError("--external-scorer-model is required for --modes external")
-    if not args.external_dsv4_tokenizer:
-        raise ValueError("--external-dsv4-tokenizer is required for --modes external")
-
-    prompt_path = out_dir / f"{stem}.external_prompt.txt"
-    scores_path = out_dir / f"{stem}.scores.txt"
-    scorer_stderr = out_dir / f"{stem}.scorer.stderr"
-    prompt_path.write_text(turn, encoding="utf-8")
-    cache_path: Path | None = None
-    cache_meta_path: Path | None = None
-    if args.external_score_cache_dir:
-        cache_dir = Path(args.external_score_cache_dir)
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_key = external_score_cache_key(args, turn)
-        cache_path = cache_dir / f"{cache_key}.scores.txt"
-        cache_meta_path = cache_dir / f"{cache_key}.scores.txt.meta.json"
-        if cache_path.exists():
-            shutil.copy2(cache_path, scores_path)
-            if cache_meta_path.exists():
-                shutil.copy2(cache_meta_path, str(scores_path) + ".meta.json")
-            n_scores = sum(1 for _ in scores_path.open("r", encoding="utf-8"))
-            print(
-                f"  external scores: cache hit {cache_path} ({n_scores} floats) -> {scores_path}",
-                file=sys.stderr,
-            )
-            return scores_path
-
-    cmd = [
-        args.external_python,
-        args.external_scorer_script,
-        "--scorer-model", args.external_scorer_model,
-        "--dsv4-tokenizer", args.external_dsv4_tokenizer,
-        "--prompt-file", str(prompt_path),
-        "--pad-head", str(args.external_pad_head),
-        "--pad-tail", str(args.external_pad_tail),
-        "--n-lookahead", str(args.external_score_lookahead),
-        "--pool-kernel", str(args.external_score_pool_kernel),
-        "--output", str(scores_path),
-    ]
-    if args.external_cpu:
-        cmd.append("--cpu")
-
-    print("  external scorer: " + shlex.join(cmd), file=sys.stderr)
-    t0 = time.perf_counter()
-    with scorer_stderr.open("w", encoding="utf-8") as serr:
-        if args.external_scorer_host:
-            proc = run_remote_external_scorer(args, cmd, prompt_path, scores_path, stem, serr)
-        else:
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=serr, text=True)
-    if proc.returncode != 0:
-        tail = scorer_stderr.read_text(errors="replace")[-4000:]
-        raise RuntimeError(
-            f"external scorer failed for {stem} with exit {proc.returncode}; "
-            f"tail of {scorer_stderr}:\n{tail}"
-        )
-    elapsed = time.perf_counter() - t0
-    n_scores = sum(1 for _ in scores_path.open("r", encoding="utf-8"))
-    print(
-        f"  external scores: {n_scores} floats in {elapsed:.2f}s -> {scores_path}",
-        file=sys.stderr,
-    )
-    if cache_path is not None:
-        shutil.copy2(scores_path, cache_path)
-        meta_path = Path(str(scores_path) + ".meta.json")
-        if meta_path.exists() and cache_meta_path is not None:
-            shutil.copy2(meta_path, cache_meta_path)
-        print(f"  external scores: cached -> {cache_path}", file=sys.stderr)
-    return scores_path
-
-
-def external_score_cache_key(args, turn: str) -> str:
-    payload = {
-        "version": 1,
-        "prompt_sha256": hashlib.sha256(turn.encode("utf-8")).hexdigest(),
-        "scorer_script": args.external_scorer_script,
-        "scorer_model": args.external_scorer_model,
-        "dsv4_tokenizer": args.external_dsv4_tokenizer,
-        "pad_head": args.external_pad_head,
-        "pad_tail": args.external_pad_tail,
-        "n_lookahead": args.external_score_lookahead,
-        "pool_kernel": args.external_score_pool_kernel,
-        "cpu": bool(args.external_cpu),
-        "scorer_host": args.external_scorer_host or "",
-        "remote_ds4_dir": args.external_remote_ds4_dir if args.external_scorer_host else "",
-    }
-    blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(blob).hexdigest()
-
-
-def run_remote_external_scorer(
-    args,
-    local_cmd: list[str],
-    prompt_path: Path,
-    scores_path: Path,
-    stem: str,
-    stderr_fp,
-) -> subprocess.CompletedProcess:
-    """Run the external scorer on a remote host and copy the score file back.
-
-    The command line in local_cmd already contains the desired scorer options.
-    This helper rewrites only the prompt/output paths for the remote host and
-    executes from --external-remote-ds4-dir so relative scorer scripts work.
-    """
-    host = args.external_scorer_host
-    remote_dir = f"{args.external_remote_work_dir.rstrip('/')}/{stem}_{os.getpid()}"
-    remote_prompt = f"{remote_dir}/{prompt_path.name}"
-    remote_scores = f"{remote_dir}/{scores_path.name}"
-
-    def run_step(step: list[str]) -> subprocess.CompletedProcess:
-        print("  remote scorer step: " + shlex.join(step), file=sys.stderr)
-        return subprocess.run(step, stdout=stderr_fp, stderr=stderr_fp, text=True)
-
-    mkdir_cmd = ["ssh", host, f"mkdir -p {shlex.quote(remote_dir)}"]
-    proc = run_step(mkdir_cmd)
-    if proc.returncode != 0:
-        return proc
-
-    proc = run_step(["scp", str(prompt_path), f"{host}:{remote_prompt}"])
-    if proc.returncode != 0:
-        return proc
-
-    remote_cmd = list(local_cmd)
-    for i, value in enumerate(remote_cmd):
-        if value == str(prompt_path):
-            remote_cmd[i] = remote_prompt
-        elif value == str(scores_path):
-            remote_cmd[i] = remote_scores
-    remote_shell = f"cd {shlex.quote(args.external_remote_ds4_dir)} && {shlex.join(remote_cmd)}"
-    proc = run_step(["ssh", host, remote_shell])
-    if proc.returncode != 0:
-        return proc
-
-    proc = run_step(["scp", f"{host}:{remote_scores}", str(scores_path)])
-    if proc.returncode != 0:
-        return proc
-
-    remote_meta = f"{remote_scores}.meta.json"
-    local_meta = str(scores_path) + ".meta.json"
-    meta_proc = run_step(["scp", f"{host}:{remote_meta}", local_meta])
-    if meta_proc.returncode != 0:
-        print(f"  [warn] remote scorer metadata copy failed for {remote_meta}", file=sys.stderr)
-
-    if not args.external_remote_keep:
-        cleanup = ["ssh", host, f"rm -rf {shlex.quote(remote_dir)}"]
-        cleanup_proc = run_step(cleanup)
-        if cleanup_proc.returncode != 0:
-            print(f"  [warn] remote scorer cleanup failed for {remote_dir}", file=sys.stderr)
-
-    return proc
-
-
-def materialize_mode_for_turn(args, mode: ModeRun, turns: list[str], out_dir: Path, stem: str) -> ModeRun:
-    if not mode.needs_external_scores:
-        return mode
-    scores_path = generate_external_scores(args, turns[0], out_dir, stem)
-    return ModeRun(
-        mode.label,
-        mode.args_extra + ["--spec-prefill-scores", str(scores_path)],
-        needs_external_scores=False,
-    )
 
 
 def load_turns(args) -> list[str]:
@@ -1162,20 +934,17 @@ def main() -> int:
     ap.add_argument("--sink", type=int, default=16)
     ap.add_argument("--tail", type=int, default=256)
     ap.add_argument("--chunk", type=int, default=32)
-    ap.add_argument("--score-layers", type=int, default=2)
-    ap.add_argument("--score-lookahead", type=int, default=4)
     ap.add_argument("--modes", nargs="+",
-                    default=["baseline", "heuristic", "selfscore"],
-                    choices=["baseline", "heuristic", "selfscore", "external", "drafter"])
+                    default=["baseline", "drafter"],
+                    choices=["baseline", "drafter"])
     ap.add_argument("--drafter-model",
+                    default=os.environ.get("DRAFTER_MODEL", "./gguf/qwen3.5-0.8b-mlx-4bit"),
                     help="Resident live drafter model for --modes drafter.")
     ap.add_argument("--drafter-python",
-                    default="/Users/carl/projects/anemll-project/env-anemll/bin/python")
+                    default=os.environ.get("DRAFTER_PYTHON", "python3"))
     ap.add_argument("--drafter-script", default="speed-bench/ds4_live_drafter.py")
     ap.add_argument("--drafter-tokenizer",
-                    default="/Users/Shared/models/ds4-gguf/dsv4-tokenizer")
-    ap.add_argument("--drafter-lib",
-                    default="/Users/carl/projects/anemll-project/scripts/heterogeneous")
+                    default=os.environ.get("DRAFTER_TOKENIZER", "./gguf/dsv4-tokenizer"))
     ap.add_argument("--spec-prefill-cache", choices=["fresh", "reuse"], default="fresh",
                     help="Cache mode for --modes drafter. Default fresh matches "
                          "mini-01: score/compress the full canonical transcript "
@@ -1188,34 +957,6 @@ def main() -> int:
                          "warm-repl keeps live KV across turns.")
     ap.add_argument("--allow-fresh-drafter-comparison", action="store_true",
                     help="Deprecated no-op retained for old scripts.")
-    ap.add_argument("--external-python", default=sys.executable,
-                    help="Python executable for --modes external scorer.")
-    ap.add_argument("--external-scorer-script", default="speed-bench/align_mlx_scores_to_dsv4.py",
-                    help="Script that maps scorer-model attention scores onto DSV4 tokens.")
-    ap.add_argument("--external-scorer-model",
-                    help="Scorer model for --modes external, e.g. /Users/Shared/models/qwen3.5-0.8b-mlx-4bit.")
-    ap.add_argument("--external-scorer-host",
-                    help="Run the external scorer on this SSH host and copy scores back.")
-    ap.add_argument("--external-remote-ds4-dir", default="/Users/carl/projects/ds4",
-                    help="Remote DS4 checkout used with --external-scorer-host.")
-    ap.add_argument("--external-remote-work-dir", default="/tmp/ds4_external_online_scorer",
-                    help="Remote scratch directory used with --external-scorer-host.")
-    ap.add_argument("--external-remote-keep", action="store_true",
-                    help="Keep remote scorer prompt/score scratch files for debugging.")
-    ap.add_argument("--external-dsv4-tokenizer",
-                    default="/Users/Shared/models/ds4-gguf/dsv4-tokenizer",
-                    help="HF tokenizer dir matching DS4 prompt content tokens.")
-    ap.add_argument("--external-score-lookahead", type=int, default=4)
-    ap.add_argument("--external-score-pool-kernel", type=int, default=13)
-    ap.add_argument("--external-pad-head", type=int, default=2)
-    ap.add_argument("--external-pad-tail", type=int, default=7)
-    ap.add_argument("--external-cpu", action="store_true")
-    ap.add_argument("--external-existing-scores-dir",
-                    help="Reuse precomputed <stem>.scores.txt files instead of invoking the scorer.")
-    ap.add_argument("--external-score-cache-dir",
-                    help="Cache generated external score files by prompt/scorer hash.")
-    ap.add_argument("--external-score-only", action="store_true",
-                    help="Generate external score files for the selected prompt/depths and exit.")
     ap.add_argument("--validate", action="store_true",
                     help="Set DS4_SCORE_VALIDATE=1 so each scoring turn also "
                          "runs the CPU scorer and emits parity diff.")
@@ -1241,15 +982,6 @@ def main() -> int:
             )
         return 0
 
-    if args.external_score_only:
-        depths = [int(x.strip()) for x in args.needle_depths.split(",") if x.strip()] if args.needle_depths else [0]
-        for depth in depths:
-            turns = (build_needle_turns(depth, args.needle_target_chars, args.needle_seed)
-                     if args.needle_depths else load_turns(args))
-            stem = f"external_d{depth:03d}" if args.needle_depths else "external"
-            generate_external_scores(args, turns[0], out_dir, stem)
-        return 0
-
     if not Path(args.ds4).exists():
         print(f"error: ds4 binary not found at {args.ds4}; run `make` first", file=sys.stderr)
         return 1
@@ -1272,8 +1004,7 @@ def main() -> int:
                 stem = f"{mode.label}_d{depth:03d}"
                 stderr_path = out_dir / f"{stem}.stderr"
                 stdout_path = out_dir / f"{stem}.stdout"
-                run_mode = materialize_mode_for_turn(args, mode, turns, out_dir, stem)
-                ms = feed_repl(args, run_mode, turns, stderr_path, stdout_path, depth=depth)
+                ms = feed_repl(args, mode, turns, stderr_path, stdout_path, depth=depth)
                 all_metrics.extend(ms)
                 grade = grade_needle_output(stdout_path.read_text(errors="replace"))
                 needle_rows.append({
@@ -1302,8 +1033,7 @@ def main() -> int:
         for mode in mode_runs:
             stderr_path = out_dir / f"{mode.label}.stderr"
             stdout_path = out_dir / f"{mode.label}.stdout"
-            run_mode = materialize_mode_for_turn(args, mode, turns, out_dir, mode.label)
-            ms = feed_repl(args, run_mode, turns, stderr_path, stdout_path)
+            ms = feed_repl(args, mode, turns, stderr_path, stdout_path)
             all_metrics.extend(ms)
             for m in ms:
                 print(
