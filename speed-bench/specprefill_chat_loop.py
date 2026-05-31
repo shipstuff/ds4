@@ -856,6 +856,11 @@ def maybe_plot(metrics: list[TurnMetrics], out_dir: Path) -> bool:
         return m.transcript_tokens or m.canonical_tokens or m.prompt_tokens or m.turn
 
     def plot_value(m: TurnMetrics, attr: str):
+        if attr == "ttft_ms":
+            if (m.mode == "baseline" and m.suffix_tokens is not None and
+                    m.canonical_tokens is not None and
+                    m.suffix_tokens != m.canonical_tokens):
+                return None
         if attr == "effective_prompt_tps":
             if (m.mode == "baseline" and m.suffix_tokens is not None and
                     m.canonical_tokens is not None and
@@ -935,6 +940,15 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
         return m.transcript_tokens or m.canonical_tokens or m.prompt_tokens or m.turn
 
     def chart_value(m: TurnMetrics, attr: str):
+        if attr == "ttft_ms":
+            # Baseline follow-up turns are warm suffix-prefill timings, not
+            # full-context TTFT at the x-axis context size.  Keep them in the
+            # table with the suffix count, but do not plot them as if they were
+            # comparable full-context points.
+            if (m.mode == "baseline" and m.suffix_tokens is not None and
+                    m.canonical_tokens is not None and
+                    m.suffix_tokens != m.canonical_tokens):
+                return None
         if attr == "effective_prompt_tps":
             # Baseline follow-up turns reuse KV and only prefill the suffix.
             # canonical_tokens / TTFT is useful for a cold prompt, but it is
@@ -956,7 +970,7 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
         fig, axes = plt.subplots(3, 1, figsize=(8.5, 9.0), dpi=140, sharex=True)
         specs = [
             ("gen_tps", "Decode tok/s"),
-            ("ttft_ms", "Chat TTFT ms"),
+            ("ttft_ms", "Comparable TTFT ms"),
             ("wall_s", "Full turn wall time s"),
         ]
         for ax, (attr, ylabel) in zip(axes, specs):
@@ -1000,6 +1014,7 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
         "- `suffix` = tokens actually prefetched/synced for the turn after KV common-prefix reuse.",
         "- `generated` = tokens emitted into the live DS4 session during the turn.",
         "- `TTFT` = chat turn start to first emitted token; DS4 breakdown includes drafter, compression, target prefill, and first decode.",
+        "- Baseline follow-up `TTFT` values are warm suffix-prefill timings; the main TTFT chart omits them instead of plotting 1-2s as full-context baseline points.",
         "- `wall time` = full scripted turn time, including the complete generated response.",
         "- `decode tok/s` = emitted tokens / decode elapsed after prefill.",
         "- Chart x-axis is total logical context tokens, matching the mini-01 Qwen revalidation style.",
@@ -1016,7 +1031,7 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
         f"{base_label} target ctx",
         f"{base_label} suffix",
         f"{base_label} generated",
-        f"{base_label} TTFT ms",
+        f"{base_label} warm TTFT ms",
         f"{base_label} wall s",
         f"{base_label} decode tok/s",
         f"{sp_label} ctx",
