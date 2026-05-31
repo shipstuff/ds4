@@ -766,6 +766,7 @@ static void ds4_vlog(FILE *fp, ds4_log_type type, const char *fmt, va_list ap) {
     if (colorize) fputs(ds4_log_color_code(type), fp);
     vfprintf(fp, fmt, ap);
     if (colorize) fputs("\x1b[0m", fp);
+    fflush(fp);
 }
 
 void ds4_log(FILE *fp, ds4_log_type type, const char *fmt, ...) {
@@ -3218,6 +3219,47 @@ static DS4_MAYBE_UNUSED bool weights_model_map_spans(
     }
     spans->len = out;
     return spans->len != 0;
+}
+
+static void model_warm_weight_spans(const ds4_model *m,
+                                    const ds4_model_map_span_vec *spans,
+                                    const char *desc) {
+    if (!m || !spans || spans->len == 0) return;
+
+    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+    const uint8_t *p = m->map;
+    uint64_t total = 0;
+    volatile uint64_t checksum = 0;
+    const double t0 = now_sec();
+
+    for (uint32_t i = 0; i < spans->len; i++) {
+        if (spans->v[i].end > spans->v[i].off) total += spans->v[i].end - spans->v[i].off;
+    }
+    if (total == 0) return;
+
+    fprintf(stderr, "ds4: warming mapped tensor pages for %s: %.2f GiB (%u spans)\n",
+            desc ? desc : "selected weights",
+            (double)total / (1024.0 * 1024.0 * 1024.0),
+            spans->len);
+
+    for (uint32_t i = 0; i < spans->len; i++) {
+        const uint64_t start = spans->v[i].off;
+        const uint64_t end = spans->v[i].end;
+        if (start >= end || end > m->size) continue;
+#if defined(POSIX_MADV_WILLNEED)
+        (void)posix_madvise((void *)(p + start), (size_t)(end - start), POSIX_MADV_WILLNEED);
+#endif
+        for (uint64_t off = start; off < end; off += page) {
+            checksum += p[off];
+        }
+        checksum += p[end - 1];
+    }
+
+    const double t1 = now_sec();
+    fprintf(stderr, "ds4: warmed tensor pages for %s in %.3fs (checksum=%llu)\n",
+            desc ? desc : "selected weights",
+            t1 - t0,
+            (unsigned long long)checksum);
 }
 
 static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
@@ -19624,10 +19666,37 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
-    if (opt->warm_weights) model_warm_weights(&e->model);
     if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
+    if (opt->warm_weights) {
+        if (load_slice) {
+            char warm_desc[64];
+            if (load_output && load_layer_end == UINT32_MAX) {
+                snprintf(warm_desc, sizeof(warm_desc), "layers %u:output", load_layer_start);
+            } else if (load_output) {
+                snprintf(warm_desc, sizeof(warm_desc), "layers %u:%u+output", load_layer_start, load_layer_end);
+            } else {
+                snprintf(warm_desc, sizeof(warm_desc), "layers %u:%u", load_layer_start, load_layer_end);
+            }
+            ds4_model_map_span_vec spans;
+            if (!weights_model_map_spans(&e->weights,
+                                         load_layer_start,
+                                         load_layer_end,
+                                         load_output,
+                                         &spans))
+            {
+                fprintf(stderr, "ds4: invalid warm-weights layer slice %s\n", warm_desc);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            model_warm_weight_spans(&e->model, &spans, warm_desc);
+            free(spans.v);
+        } else {
+            model_warm_weights(&e->model);
+        }
+    }
     if (opt->inspect_only) {
         *out = e;
         return 0;
@@ -20097,6 +20166,17 @@ static DS4_MAYBE_UNUSED void ds4_session_slice_commit_timeline(ds4_session *s, c
     s->mtp_draft_valid = false;
 }
 
+static void ds4_layer_slice_debug(const char *fmt, ...) {
+    if (getenv("DS4_LAYER_SLICE_DEBUG") == NULL) return;
+    va_list ap;
+    va_start(ap, fmt);
+    fputs("ds4: layer-slice debug: ", stderr);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    fflush(stderr);
+    va_end(ap);
+}
+
 int ds4_session_eval_layer_slice(ds4_session *s,
                                  const int *tokens,
                                  uint32_t n_tokens,
@@ -20146,6 +20226,14 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     s->checkpoint_valid = false;
     return 1;
 #else
+    ds4_layer_slice_debug("start layers=%u:%u pos=%u tokens=%u input_hc=%d output_hc=%d logits=%d",
+                          layer_start,
+                          layer_end,
+                          pos0,
+                          n_tokens,
+                          input_hc ? 1 : 0,
+                          output_hc ? 1 : 0,
+                          output_logits ? 1 : 0);
     if (n_tokens > s->prefill_cap) {
         if (errlen) snprintf(err, errlen, "layer-slice chunk %u exceeds prefill cap %u",
                              n_tokens, s->prefill_cap);
@@ -20301,10 +20389,13 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         .cap = (int)n_tokens,
     };
 
+    ds4_layer_slice_debug("upload tokens");
     bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, &span, 0, n_tokens);
     if (ok && input_hc) {
+        ds4_layer_slice_debug("write input hidden bytes=%llu", (unsigned long long)hc_bytes);
         ok = ds4_gpu_tensor_write(g->batch_cur_hc, 0, input_hc, hc_bytes) != 0;
     } else if (ok) {
+        ds4_layer_slice_debug("upload embeddings");
         ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
                                                      g->prefill_tokens,
                                                      &e->model,
@@ -20316,16 +20407,25 @@ int ds4_session_eval_layer_slice(ds4_session *s,
 
     ds4_gpu_tensor *last_hc = NULL;
     ds4_gpu_tensor *saved_cur = NULL;
+    const bool flush_each_layer = getenv("DS4_LAYER_SLICE_FLUSH_EACH_LAYER") != NULL;
+    ds4_layer_slice_debug("begin commands");
     if (ok) ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+        ds4_layer_slice_debug("encode layer %u", il);
         ok = metal_graph_encode_layer_batch(g,
                                             &e->model,
                                             &e->weights.layer[il],
                                             il,
                                             pos0,
                                             n_tokens);
+        if (ok && flush_each_layer && (il < layer_end || output_logits)) {
+            ds4_layer_slice_debug("flush after layer %u", il);
+            ok = ds4_gpu_flush_commands() != 0;
+            ds4_layer_slice_debug("flush after layer %u rc=%d", il, ok ? 0 : 1);
+        }
     }
     if (ok && output_logits) {
+        ds4_layer_slice_debug("encode output head");
         saved_cur = g->cur_hc;
         last_hc = metal_graph_tensor_row_view(g->batch_cur_hc, n_tokens - 1u, hc_dim);
         ok = last_hc != NULL;
@@ -20335,15 +20435,21 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             g->cur_hc = saved_cur;
         }
     }
+    ds4_layer_slice_debug("end commands");
     if (ok) ok = ds4_gpu_end_commands() != 0;
     if (saved_cur) g->cur_hc = saved_cur;
     if (last_hc) ds4_gpu_tensor_free(last_hc);
 
-    if (ok && !output_hc && !output_logits) ok = ds4_gpu_synchronize() != 0;
+    if (ok && !output_hc && !output_logits) {
+        ds4_layer_slice_debug("synchronize no-output");
+        ok = ds4_gpu_synchronize() != 0;
+    }
     if (ok && output_hc) {
+        ds4_layer_slice_debug("read output hidden bytes=%llu", (unsigned long long)hc_bytes);
         ok = ds4_gpu_tensor_read(g->batch_cur_hc, 0, output_hc, hc_bytes) != 0;
     }
     if (ok && output_logits) {
+        ds4_layer_slice_debug("read logits");
         ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
     if (!ok) {
@@ -20357,6 +20463,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     }
 
     ds4_session_slice_commit_timeline(s, tokens, n_tokens);
+    ds4_layer_slice_debug("done");
     return 0;
 #endif
 }

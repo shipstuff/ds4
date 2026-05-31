@@ -23,6 +23,8 @@
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 
 typedef struct {
     const char *prompt;
@@ -70,6 +72,11 @@ typedef struct {
      * Default 85. */
     int spec_prefill_recompress_at_pct;
     const char *spec_prefill_scores_path;
+    const char *spec_prefill_drafter_model;
+    const char *spec_prefill_drafter_python;
+    const char *spec_prefill_drafter_script;
+    const char *spec_prefill_drafter_tokenizer;
+    const char *spec_prefill_drafter_lib;
     /* Native in-engine scoring (calls ds4_engine_score_prompt on the loaded
      * model).  CPU backend only in v1; the CLI falls back to the recency
      * heuristic on Metal/CUDA unless --spec-prefill-scores is supplied. */
@@ -86,10 +93,17 @@ typedef struct {
 } cli_generation_options;
 
 typedef struct {
+    pid_t pid;
+    int in_fd;
+    FILE *out_fp;
+} cli_live_drafter;
+
+typedef struct {
     ds4_engine_options engine;
     ds4_dist_options *dist;
     cli_generation_options gen;
     char *prompt_owned;
+    cli_live_drafter drafter;
     bool inspect;
 } cli_config;
 
@@ -278,6 +292,18 @@ static void usage(FILE *fp) {
         "      anemll-project harness's score_tokens() or by the bundled\n"
         "      misc/tools/dump_specprefill_scores.py (transformers-based,\n"
         "      arch-agnostic).\n"
+        "  --spec-prefill-drafter-model PATH\n"
+        "      Enable the live local drafter lane. ds4 starts a resident\n"
+        "      MLX/Qwen scorer helper and asks it for fresh scores at each\n"
+        "      SpecPrefill compression. No heuristic fallback is used.\n"
+        "  --spec-prefill-drafter-python PATH\n"
+        "      Python executable for the resident drafter helper. Default: /Users/carl/projects/anemll-project/env-anemll/bin/python.\n"
+        "  --spec-prefill-drafter-script PATH\n"
+        "      Helper script. Default: speed-bench/ds4_live_drafter.py.\n"
+        "  --spec-prefill-drafter-tokenizer PATH\n"
+        "      DSV4 HF tokenizer directory. Default: /Users/Shared/models/ds4-gguf/dsv4-tokenizer.\n"
+        "  --spec-prefill-drafter-lib PATH\n"
+        "      Optional anemll specprefill_lib root for the helper.\n"
         "  --spec-prefill-self-score\n"
         "      Score the prompt with ds4's own attention math (no external\n"
         "      draft).  Available on all backends; the scorer dispatches to\n"
@@ -306,6 +332,8 @@ static void usage(FILE *fp) {
         "      Select normal thinking, context-gated Think Max, or non-thinking mode.\n"
         "  /ctx N\n"
         "      Recreate the interactive session with a new context size.\n"
+        "  /status\n"
+        "      Print current chat context and SpecPrefill accounting without changing the session.\n"
         "  /power N\n"
         "      Set GPU duty cycle percentage, 1..100.\n"
         "  /read FILE\n"
@@ -449,6 +477,13 @@ static double cli_now_sec(void) {
 }
 
 static char *read_prompt_file(const char *path, bool fatal);
+typedef struct repl_chat repl_chat;
+static int cli_live_drafter_score(cli_config *cfg, ds4_engine *engine,
+                                  const ds4_tokens *prompt,
+                                  float **scores_out, int *scores_len_out,
+                                  double *score_ms_out,
+                                  char *err, size_t errlen);
+static void cli_live_drafter_stop(cli_config *cfg);
 
 typedef struct {
     int base_tokens;
@@ -1087,7 +1122,7 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
     return 0;
 }
 
-static int run_generation(ds4_engine *engine, const cli_config *cfg) {
+static int run_generation(ds4_engine *engine, cli_config *cfg) {
     ds4_tokens prompt = {0};
     build_prompt(engine, &cfg->gen, &prompt);
 
@@ -1110,7 +1145,22 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
 
         float *scores_buf = NULL;
         int scores_len = 0;
-        if (cfg->gen.spec_prefill_scores_path) {
+        const bool use_live_drafter = cfg->gen.spec_prefill_drafter_model &&
+                                      prompt.len > cfg->gen.spec_prefill_tail;
+        if (use_live_drafter) {
+            double drafter_ms = 0.0;
+            char derr[256];
+            if (cli_live_drafter_score(cfg, engine, &prompt,
+                                       &scores_buf, &scores_len, &drafter_ms,
+                                       derr, sizeof(derr)) != 0) {
+                fprintf(stderr, "ds4: %s\n", derr);
+                ds4_tokens_free(&prompt);
+                return 1;
+            }
+            spo.scores     = scores_buf;
+            spo.scores_len = scores_len;
+            spo.self_score = false;
+        } else if (cfg->gen.spec_prefill_scores_path) {
             char err[256];
             if (ds4_spec_prefill_load_scores_file(cfg->gen.spec_prefill_scores_path,
                                                   prompt.len, &scores_buf, &scores_len,
@@ -1135,8 +1185,10 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
             ds4_tokens_free(&prompt);
             return 1;
         }
-        const char *score_src = "heuristic";
-        if (cfg->gen.spec_prefill_scores_path) score_src = cfg->gen.spec_prefill_scores_path;
+        const bool did_compress = compressed.len < prompt.len;
+        const char *score_src = did_compress ? "heuristic" : "none/no-compress";
+        if (use_live_drafter) score_src = "drafter-live-local";
+        else if (cfg->gen.spec_prefill_scores_path) score_src = cfg->gen.spec_prefill_scores_path;
         else if (spo.self_score)               score_src = "self-score";
         ds4_log(stderr, DS4_LOG_PREFILL,
                 "spec-prefill: prompt %d -> %d tokens (keep=%.2f sink=%d tail=%d chunk=%d scores=%s)\n",
@@ -1237,6 +1289,7 @@ static void print_repl_help(void) {
     puts("  /think-max     Use Think Max only when context is at least 393216 tokens.");
     puts("  /nothink       Disable thinking mode.");
     puts("  /ctx N         Set context size for following prompts.");
+    puts("  /status        Show context/session token accounting.");
     puts("  /power N       Set GPU duty cycle percentage, 1..100.");
     puts("  /read FILE     Read a prompt from FILE and run it.");
     puts("  /quit, /exit   Leave the prompt.");
@@ -1257,7 +1310,7 @@ static void history_file_path(char *buf, size_t len) {
     snprintf(buf, len, "%s/.ds4_history", home);
 }
 
-typedef struct {
+struct repl_chat {
     ds4_session *session;
     ds4_tokens transcript;
     int ctx_size;
@@ -1276,7 +1329,10 @@ typedef struct {
      * the session is fresh, equal to chat->transcript.len after each
      * successful sync (and after the post-decode EOS push). */
     int transcript_consumed_up_to;
-} repl_chat;
+    int last_sync_target_tokens;
+    int last_prefill_suffix_tokens;
+    int last_compressed_prompt_tokens;
+};
 
 static void tokens_insert(ds4_tokens *dst, int pos, const ds4_tokens *src) {
     if (!src || src->len <= 0) return;
@@ -1363,7 +1419,260 @@ static int repl_chat_set_ctx(ds4_engine *engine, repl_chat *chat, int ctx_size) 
     /* New session has empty checkpoint -- force next turn through the
      * cold-compress path of the SpecPrefill chat-loop strategy. */
     chat->transcript_consumed_up_to = 0;
+    chat->last_sync_target_tokens = 0;
+    chat->last_prefill_suffix_tokens = 0;
+    chat->last_compressed_prompt_tokens = 0;
     return repl_chat_create_session(engine, chat, ctx_size);
+}
+
+static void repl_chat_status(const cli_config *cfg, const repl_chat *chat) {
+    if (!chat || !chat->session) {
+        puts("Status: no active session.");
+        return;
+    }
+    const int ctx = ds4_session_ctx(chat->session);
+    const int session_pos = ds4_session_pos(chat->session);
+    const int remaining = ctx > session_pos ? ctx - session_pos : 0;
+    const int canonical = chat->transcript.len;
+    int unconsumed = canonical - chat->transcript_consumed_up_to;
+    if (unconsumed < 0) unconsumed = 0;
+
+    printf("Status:\n");
+    printf("  ctx: %d\n", ctx);
+    printf("  session_tokens: %d\n", session_pos);
+    printf("  remaining_session_tokens: %d\n", remaining);
+    printf("  canonical_transcript_tokens: %d\n", canonical);
+    printf("  canonical_consumed_tokens: %d\n", chat->transcript_consumed_up_to);
+    printf("  canonical_unconsumed_tokens: %d\n", unconsumed);
+    printf("  last_sync_target_tokens: %d\n", chat->last_sync_target_tokens);
+    printf("  last_prefill_suffix_tokens: %d\n", chat->last_prefill_suffix_tokens);
+    if (chat->last_compressed_prompt_tokens > 0) {
+        printf("  last_compressed_prompt_tokens: %d\n",
+               chat->last_compressed_prompt_tokens);
+    } else {
+        printf("  last_compressed_prompt_tokens: n/a\n");
+    }
+    printf("  spec_prefill: %s\n",
+           cfg && cfg->gen.spec_prefill_enabled ? "on" : "off");
+    if (cfg && cfg->gen.spec_prefill_enabled) {
+        printf("  spec_prefill_cache: %s\n",
+               cfg->gen.spec_prefill_cache_reuse ? "reuse" : "fresh");
+        printf("  spec_prefill_keep: %.2f\n", cfg->gen.spec_prefill_keep_pct);
+        printf("  spec_prefill_sink: %d\n", cfg->gen.spec_prefill_sink);
+        printf("  spec_prefill_tail: %d\n", cfg->gen.spec_prefill_tail);
+        printf("  spec_prefill_chunk: %d\n", cfg->gen.spec_prefill_chunk);
+        printf("  live_drafter: %s\n",
+               cfg->gen.spec_prefill_drafter_model ? "on" : "off");
+    }
+    fflush(stdout);
+}
+
+static int write_all_fd(int fd, const void *buf, size_t len) {
+    const unsigned char *p = buf;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static char *render_tokens_text(ds4_engine *engine, const ds4_tokens *tokens, size_t *out_len) {
+    size_t len = 0;
+    size_t cap = 4096;
+    char *buf = malloc(cap);
+    if (!buf) return NULL;
+    for (int i = 0; i < tokens->len; i++) {
+        size_t piece_len = 0;
+        char *piece = ds4_token_text(engine, tokens->v[i], &piece_len);
+        if (!piece && piece_len > 0) {
+            free(buf);
+            return NULL;
+        }
+        if (len + piece_len + 1 > cap) {
+            while (len + piece_len + 1 > cap) cap *= 2;
+            char *next = realloc(buf, cap);
+            if (!next) {
+                free(piece);
+                free(buf);
+                return NULL;
+            }
+            buf = next;
+        }
+        if (piece_len > 0) memcpy(buf + len, piece, piece_len);
+        len += piece_len;
+        free(piece);
+    }
+    buf[len] = '\0';
+    if (out_len) *out_len = len;
+    return buf;
+}
+
+static int cli_live_drafter_start(cli_config *cfg, char *err, size_t errlen) {
+    if (cfg->drafter.pid > 0) return 0;
+    const char *python = cfg->gen.spec_prefill_drafter_python ?
+        cfg->gen.spec_prefill_drafter_python : "/Users/carl/projects/anemll-project/env-anemll/bin/python";
+    const char *script = cfg->gen.spec_prefill_drafter_script ?
+        cfg->gen.spec_prefill_drafter_script : "speed-bench/ds4_live_drafter.py";
+    const char *tokenizer = cfg->gen.spec_prefill_drafter_tokenizer ?
+        cfg->gen.spec_prefill_drafter_tokenizer : "/Users/Shared/models/ds4-gguf/dsv4-tokenizer";
+    const char *lib = cfg->gen.spec_prefill_drafter_lib ?
+        cfg->gen.spec_prefill_drafter_lib : "/Users/carl/projects/anemll-project/scripts/heterogeneous";
+    char lookahead_arg[32];
+    char pool_arg[32];
+    snprintf(lookahead_arg, sizeof(lookahead_arg), "%d", cfg->gen.spec_prefill_score_lookahead);
+    snprintf(pool_arg, sizeof(pool_arg), "%d", cfg->gen.spec_prefill_score_pool_kernel);
+
+    int to_child[2];
+    int from_child[2];
+    if (pipe(to_child) != 0 || pipe(from_child) != 0) {
+        snprintf(err, errlen, "live drafter pipe failed: %s", strerror(errno));
+        return -1;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        snprintf(err, errlen, "live drafter fork failed: %s", strerror(errno));
+        close(to_child[0]); close(to_child[1]);
+        close(from_child[0]); close(from_child[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        dup2(to_child[0], STDIN_FILENO);
+        dup2(from_child[1], STDOUT_FILENO);
+        close(to_child[0]); close(to_child[1]);
+        close(from_child[0]); close(from_child[1]);
+        execlp(python, python, "-u", script,
+               "--scorer-model", cfg->gen.spec_prefill_drafter_model,
+               "--dsv4-tokenizer", tokenizer,
+               "--specprefill-lib", lib,
+               "--n-lookahead", lookahead_arg,
+               "--pool-kernel", pool_arg,
+               (char *)NULL);
+        fprintf(stderr, "ds4: exec live drafter failed: %s\n", strerror(errno));
+        _exit(127);
+    }
+
+    close(to_child[0]);
+    close(from_child[1]);
+    FILE *out = fdopen(from_child[0], "rb");
+    if (!out) {
+        snprintf(err, errlen, "live drafter fdopen failed: %s", strerror(errno));
+        close(to_child[1]);
+        close(from_child[0]);
+        kill(pid, SIGTERM);
+        waitpid(pid, NULL, 0);
+        return -1;
+    }
+    cfg->drafter.pid = pid;
+    cfg->drafter.in_fd = to_child[1];
+    cfg->drafter.out_fp = out;
+    ds4_log(stderr, DS4_LOG_PREFILL,
+            "spec-prefill: live local drafter started pid=%ld model=%s\n",
+            (long)pid, cfg->gen.spec_prefill_drafter_model);
+
+    char ready[128];
+    if (!fgets(ready, sizeof(ready), cfg->drafter.out_fp)) {
+        snprintf(err, errlen, "live drafter closed before ready");
+        cli_live_drafter_stop(cfg);
+        return -1;
+    }
+    if (strcmp(ready, "READY\n") != 0) {
+        snprintf(err, errlen, "live drafter startup error: %.96s", ready);
+        cli_live_drafter_stop(cfg);
+        return -1;
+    }
+    ds4_log(stderr, DS4_LOG_PREFILL,
+            "spec-prefill: live local drafter ready pid=%ld\n",
+            (long)pid);
+    return 0;
+}
+
+static void cli_live_drafter_stop(cli_config *cfg) {
+    if (cfg->drafter.in_fd > 0) {
+        (void)write_all_fd(cfg->drafter.in_fd, "QUIT\n", 5);
+        close(cfg->drafter.in_fd);
+        cfg->drafter.in_fd = -1;
+    }
+    if (cfg->drafter.out_fp) {
+        fclose(cfg->drafter.out_fp);
+        cfg->drafter.out_fp = NULL;
+    }
+    if (cfg->drafter.pid > 0) {
+        waitpid(cfg->drafter.pid, NULL, 0);
+        cfg->drafter.pid = 0;
+    }
+}
+
+static int cli_live_drafter_score(cli_config *cfg, ds4_engine *engine,
+                                  const ds4_tokens *prompt,
+                                  float **scores_out, int *scores_len_out,
+                                  double *score_ms_out,
+                                  char *err, size_t errlen) {
+    *scores_out = NULL;
+    *scores_len_out = 0;
+    if (score_ms_out) *score_ms_out = 0.0;
+    if (cli_live_drafter_start(cfg, err, errlen) != 0) return -1;
+
+    size_t text_len = 0;
+    char *text = render_tokens_text(engine, prompt, &text_len);
+    if (!text) {
+        snprintf(err, errlen, "live drafter failed to render transcript");
+        return -1;
+    }
+
+    char header[128];
+    int header_len = snprintf(header, sizeof(header), "SCORE %d %zu\n",
+                              prompt->len, text_len);
+    if (header_len <= 0 || (size_t)header_len >= sizeof(header) ||
+        write_all_fd(cfg->drafter.in_fd, header, (size_t)header_len) != 0 ||
+        write_all_fd(cfg->drafter.in_fd, text, text_len) != 0) {
+        free(text);
+        snprintf(err, errlen, "live drafter request write failed: %s", strerror(errno));
+        return -1;
+    }
+    free(text);
+
+    char line[256];
+    if (!fgets(line, sizeof(line), cfg->drafter.out_fp)) {
+        snprintf(err, errlen, "live drafter closed before response");
+        return -1;
+    }
+    int n = 0;
+    double total_ms = 0.0, tokenize_ms = 0.0, score_ms = 0.0, align_ms = 0.0;
+    if (sscanf(line, "OK %d %lf %lf %lf %lf", &n, &total_ms, &tokenize_ms,
+               &score_ms, &align_ms) != 5) {
+        snprintf(err, errlen, "live drafter error: %.220s", line);
+        return -1;
+    }
+    if (n != prompt->len) {
+        snprintf(err, errlen, "live drafter returned %d scores for %d tokens",
+                 n, prompt->len);
+        return -1;
+    }
+    float *scores = malloc((size_t)n * sizeof(scores[0]));
+    if (!scores) {
+        snprintf(err, errlen, "out of memory reading live drafter scores");
+        return -1;
+    }
+    size_t got = fread(scores, sizeof(scores[0]), (size_t)n, cfg->drafter.out_fp);
+    if (got != (size_t)n) {
+        free(scores);
+        snprintf(err, errlen, "live drafter score payload truncated (%zu/%d)", got, n);
+        return -1;
+    }
+    *scores_out = scores;
+    *scores_len_out = n;
+    if (score_ms_out) *score_ms_out = total_ms;
+    ds4_log(stderr, DS4_LOG_PREFILL,
+            "spec-prefill: live drafter scored %d tokens in %.2f ms "
+            "(tokenize=%.2f score=%.2f align=%.2f)\n",
+            n, total_ms, tokenize_ms, score_ms, align_ms);
+    return 0;
 }
 
 /* Run one interactive turn.  The transcript is tentatively extended with user
@@ -1376,12 +1685,16 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
         return 1;
     }
 
+    const double t_turn0 = cli_now_sec();
+    double ttft_drafter_ms = 0.0;
+    double ttft_compress_ms = 0.0;
     ds4_think_mode think_mode = ds4_think_mode_for_context(cfg->gen.think_mode,
                                                            chat->ctx_size);
     repl_chat_apply_max_prefix(engine, chat, think_mode == DS4_THINK_MAX);
     const int rollback_len = chat->transcript.len;
     ds4_chat_append_message(engine, &chat->transcript, "user", user_text);
     ds4_chat_append_assistant_prefix(engine, &chat->transcript, think_mode);
+    const int ttft_canonical_prompt_tokens = chat->transcript.len;
 
     /* SpecPrefill chat-loop strategy.  Two lanes, selectable with
      * --spec-prefill-cache (default: fresh).
@@ -1406,6 +1719,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     ds4_tokens spec_compressed = {0};
     ds4_tokens warm_target = {0};
     const ds4_tokens *sync_target = &chat->transcript;
+    int status_compressed_tokens = 0;
     if (cfg->gen.spec_prefill_enabled) {
         const bool reuse = cfg->gen.spec_prefill_cache_reuse;
         const int session_pos = ds4_session_pos(chat->session);
@@ -1451,7 +1765,23 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
             float *scores_buf = NULL;
             int    scores_len = 0;
-            if (cfg->gen.spec_prefill_scores_path) {
+            const bool use_live_drafter = cfg->gen.spec_prefill_drafter_model &&
+                                          chat->transcript.len > cfg->gen.spec_prefill_tail;
+            if (use_live_drafter) {
+                double drafter_ms = 0.0;
+                char sferr[256];
+                if (cli_live_drafter_score(cfg, engine, &chat->transcript,
+                                           &scores_buf, &scores_len, &drafter_ms,
+                                           sferr, sizeof(sferr)) != 0) {
+                    fprintf(stderr, "ds4: %s\n", sferr);
+                    chat->transcript.len = rollback_len;
+                    return 1;
+                }
+                ttft_drafter_ms += drafter_ms;
+                spo.scores     = scores_buf;
+                spo.scores_len = scores_len;
+                spo.self_score = false;
+            } else if (cfg->gen.spec_prefill_scores_path) {
                 char sferr[256];
                 if (ds4_spec_prefill_load_scores_file(cfg->gen.spec_prefill_scores_path,
                                                       chat->transcript.len,
@@ -1467,6 +1797,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
             }
 
             char cerr[256];
+            const double t_compress0 = cli_now_sec();
             /* Always score against the FULL canonical transcript.  In
              * reuse-mode recompress this is the anemll critical detail
              * (don't bias the rescore by the working-set cache); in fresh
@@ -1479,10 +1810,15 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                 fprintf(stderr, "ds4: %s\n", cerr);
                 return 1;
             }
+            const double t_compress1 = cli_now_sec();
+            ttft_compress_ms += (t_compress1 - t_compress0) * 1000.0;
             free(scores_buf);
 
-            const char *score_src = "heuristic";
-            if (cfg->gen.spec_prefill_scores_path) score_src = cfg->gen.spec_prefill_scores_path;
+            const bool did_compress = spec_compressed.len < chat->transcript.len;
+            status_compressed_tokens = spec_compressed.len;
+            const char *score_src = did_compress ? "heuristic" : "none/no-compress";
+            if (use_live_drafter) score_src = "drafter-live-local";
+            else if (cfg->gen.spec_prefill_scores_path) score_src = cfg->gen.spec_prefill_scores_path;
             else if (spo.self_score)               score_src = "self-score";
             const char *path_label = !reuse ? "fresh" : (reuse_cold ? "cold" : "recompress");
             ds4_log(stderr, DS4_LOG_PREFILL,
@@ -1509,12 +1845,12 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     const int suffix = sync_target->len - cached;
 
     char err[160];
+    const double t_prefill0 = cli_now_sec();
     cli_prefill_progress progress = {
         .base_tokens = cached,
         .input_tokens = suffix,
         .use_color = ds4_log_is_tty(stderr),
     };
-    const double t_prefill0 = cli_now_sec();
     ds4_session_set_progress(chat->session, cli_prefill_progress_cb, &progress);
     ds4_session_set_display_progress(chat->session,
                                      progress.use_color ? cli_prefill_progress_cb : NULL,
@@ -1522,6 +1858,13 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     /* sync_target is the SpecPrefill-compressed / warm-extend view when
      * spec-prefill is enabled, else &chat->transcript.  Keep the
      * distributed busy guards around the sync either way. */
+    if (cli_wait_distributed_route(cfg, chat->session) != 0) {
+        ds4_session_set_progress(chat->session, NULL, NULL);
+        ds4_session_set_display_progress(chat->session, NULL, NULL);
+        ds4_tokens_free(&spec_compressed); ds4_tokens_free(&warm_target);
+        chat->transcript.len = rollback_len;
+        return 1;
+    }
     cli_dist_busy_set(cfg, true);
     int sync_rc = ds4_session_sync(chat->session, sync_target, err, sizeof(err));
     cli_dist_busy_set(cfg, false);
@@ -1536,6 +1879,10 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     ds4_session_set_progress(chat->session, NULL, NULL);
     ds4_session_set_display_progress(chat->session, NULL, NULL);
     const double t_prefill1 = cli_now_sec();
+    const double prefill_s = t_prefill1 - t_prefill0;
+    chat->last_sync_target_tokens = sync_target->len;
+    chat->last_prefill_suffix_tokens = suffix;
+    chat->last_compressed_prompt_tokens = status_compressed_tokens;
 
     token_printer printer = {
         .engine = engine,
@@ -1550,10 +1897,20 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     int room = ds4_session_ctx(chat->session) - ds4_session_pos(chat->session);
     if (room <= 1) max_tokens = 0;
     else if (max_tokens > room - 1) max_tokens = room - 1;
+    ds4_log(stderr,
+            DS4_LOG_TIMING,
+            "ds4: ctx before generation: session=%d/%d remaining=%d "
+            "transcript=%d sync_target=%d\n",
+            ds4_session_pos(chat->session),
+            ds4_session_ctx(chat->session),
+            room > 0 ? room : 0,
+            chat->transcript.len,
+            sync_target->len);
 
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     int generated = 0;
+    double t_first_token = 0.0;
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token = ds4_session_sample(chat->session,
@@ -1607,6 +1964,9 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
             ds4_tokens_push(&chat->transcript, toks[j]);
             token_printer_write_text(&printer, piece, piece_len);
             fflush(stdout);
+            if (generated == 0 && t_first_token == 0.0) {
+                t_first_token = cli_now_sec();
+            }
             free(piece);
             generated++;
             if (generated >= max_tokens) break;
@@ -1632,14 +1992,66 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
         ds4_tokens_push(&chat->transcript, ds4_token_eos(engine));
     }
 
-    const double prefill_s = t_prefill1 - t_prefill0;
     const double decode_s = t_decode1 - t_decode0;
     if (interrupted) cli_interrupt_clear();
+    if (generated > 0 && t_first_token > 0.0) {
+        const double ttft_ms = (t_first_token - t_turn0) * 1000.0;
+        const double prefill_ms = (t_prefill1 - t_prefill0) * 1000.0;
+        const double first_decode_ms = (t_first_token - t_decode0) * 1000.0;
+        const double ttft_s = ttft_ms / 1000.0;
+        const double target_prefill_s = prefill_ms / 1000.0;
+        const double drafter_s = ttft_drafter_ms / 1000.0;
+        ds4_log(stderr,
+                DS4_LOG_TIMING,
+                "ds4: ttft: %.2f ms "
+                "(drafter=%.2f ms compress=%.2f ms prefill=%.2f ms first_decode=%.2f ms) "
+                "tokens: canonical=%d sync=%d suffix=%d generated_first=1 "
+                "rates: effective_prompt=%.2f t/s target_prefill=%.2f t/s drafter=%.2f t/s "
+                "generation=%.2f t/s ctx=%d/%d remaining=%d transcript=%d\n",
+                ttft_ms,
+                ttft_drafter_ms,
+                ttft_compress_ms,
+                prefill_ms,
+                first_decode_ms,
+                ttft_canonical_prompt_tokens,
+                chat->last_sync_target_tokens,
+                chat->last_prefill_suffix_tokens,
+                ttft_s > 0.0 ? (double)ttft_canonical_prompt_tokens / ttft_s : 0.0,
+                target_prefill_s > 0.0 ? (double)chat->last_prefill_suffix_tokens / target_prefill_s : 0.0,
+                drafter_s > 0.0 ? (double)ttft_canonical_prompt_tokens / drafter_s : 0.0,
+                decode_s > 0.0 ? (double)generated / decode_s : 0.0,
+                ds4_session_pos(chat->session),
+                ds4_session_ctx(chat->session),
+                ds4_session_ctx(chat->session) > ds4_session_pos(chat->session) ?
+                    ds4_session_ctx(chat->session) - ds4_session_pos(chat->session) : 0,
+                chat->transcript.len);
+    } else {
+        const double turn_ms = (t_decode1 - t_turn0) * 1000.0;
+        const double prefill_ms = (t_prefill1 - t_prefill0) * 1000.0;
+        ds4_log(stderr,
+                DS4_LOG_TIMING,
+                "ds4: ttft: n/a (no token emitted, turn=%.2f ms "
+                "drafter=%.2f ms compress=%.2f ms prefill=%.2f ms) "
+                "tokens: canonical=%d sync=%d suffix=%d\n",
+                turn_ms,
+                ttft_drafter_ms,
+                ttft_compress_ms,
+                prefill_ms,
+                ttft_canonical_prompt_tokens,
+                chat->last_sync_target_tokens,
+                chat->last_prefill_suffix_tokens);
+    }
     ds4_log(stderr,
             DS4_LOG_TIMING,
-            "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
+            "ds4: prefill: %.2f t/s, generation: %.2f t/s, "
+            "ctx: %d/%d remaining=%d transcript=%d\n",
             prefill_s > 0.0 ? (double)suffix / prefill_s : 0.0,
-            decode_s > 0.0 ? (double)generated / decode_s : 0.0);
+            decode_s > 0.0 ? (double)generated / decode_s : 0.0,
+            ds4_session_pos(chat->session),
+            ds4_session_ctx(chat->session),
+            ds4_session_ctx(chat->session) > ds4_session_pos(chat->session) ?
+                ds4_session_ctx(chat->session) - ds4_session_pos(chat->session) : 0,
+            chat->transcript.len);
     ds4_tokens_free(&spec_compressed); ds4_tokens_free(&warm_target);
     return 0;
 }
@@ -1647,6 +2059,14 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 static int run_repl(ds4_engine *engine, cli_config *cfg) {
     repl_chat chat;
     if (repl_chat_init(engine, &chat, cfg) != 0) return 1;
+    if (cfg->gen.spec_prefill_enabled && cfg->gen.spec_prefill_drafter_model) {
+        char err[256];
+        if (cli_live_drafter_start(cfg, err, sizeof(err)) != 0) {
+            fprintf(stderr, "ds4: %s\n", err);
+            repl_chat_free(&chat);
+            return 1;
+        }
+    }
 
     struct sigaction old_int;
     struct sigaction sa;
@@ -1684,6 +2104,8 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
 
         if (!strcmp(cmd, "/help")) {
             print_repl_help();
+        } else if (!strcmp(cmd, "/status")) {
+            repl_chat_status(cfg, &chat);
         } else if (!strcmp(cmd, "/think")) {
             cfg->gen.think_mode = DS4_THINK_HIGH;
             repl_chat_apply_max_prefix(engine, &chat, false);
@@ -1839,6 +2261,11 @@ static cli_config parse_options(int argc, char **argv) {
             .spec_prefill_cache_reuse = false,
             .spec_prefill_recompress_at_pct = 85,
             .spec_prefill_scores_path = NULL,
+            .spec_prefill_drafter_model = NULL,
+            .spec_prefill_drafter_python = "/Users/carl/projects/anemll-project/env-anemll/bin/python",
+            .spec_prefill_drafter_script = "speed-bench/ds4_live_drafter.py",
+            .spec_prefill_drafter_tokenizer = "/Users/Shared/models/ds4-gguf/dsv4-tokenizer",
+            .spec_prefill_drafter_lib = "/Users/carl/projects/anemll-project/scripts/heterogeneous",
             .spec_prefill_self_score = false,
             .spec_prefill_score_layers = 2,
             .spec_prefill_score_lookahead = 4,
@@ -2014,6 +2441,17 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--spec-prefill-scores")) {
             c.gen.spec_prefill_scores_path = need_arg(&i, argc, argv, arg);
             c.gen.spec_prefill_enabled = true;
+        } else if (!strcmp(arg, "--spec-prefill-drafter-model")) {
+            c.gen.spec_prefill_drafter_model = need_arg(&i, argc, argv, arg);
+            c.gen.spec_prefill_enabled = true;
+        } else if (!strcmp(arg, "--spec-prefill-drafter-python")) {
+            c.gen.spec_prefill_drafter_python = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--spec-prefill-drafter-script")) {
+            c.gen.spec_prefill_drafter_script = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--spec-prefill-drafter-tokenizer")) {
+            c.gen.spec_prefill_drafter_tokenizer = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--spec-prefill-drafter-lib")) {
+            c.gen.spec_prefill_drafter_lib = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--spec-prefill-self-score")) {
             c.gen.spec_prefill_self_score = true;
             c.gen.spec_prefill_enabled = true;
@@ -2132,6 +2570,18 @@ int main(int argc, char **argv) {
         return rc;
     }
     cfg.engine.inspect_only = cfg.inspect;
+    if (cfg.dist && cfg.dist->role == DS4_DISTRIBUTED_WORKER &&
+        getenv("DS4_DIST_DISABLE_WORKER_PRECONNECT") == NULL) {
+        char err[256] = {0};
+        if (ds4_dist_worker_preconnect_control(cfg.dist, err, sizeof(err)) != 0) {
+            fprintf(stderr,
+                    "ds4: distributed worker preconnect failed: %s\n",
+                    err[0] ? err : "unknown error");
+            ds4_dist_options_free(cfg.dist);
+            free(cfg.prompt_owned);
+            return 1;
+        }
+    }
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) {
         ds4_dist_options_free(cfg.dist);
@@ -2180,6 +2630,7 @@ int main(int argc, char **argv) {
     } else {
         rc = run_generation(engine, &cfg);
     }
+    cli_live_drafter_stop(&cfg);
     ds4_engine_close(engine);
     ds4_dist_options_free(cfg.dist);
     free(cfg.prompt_owned);

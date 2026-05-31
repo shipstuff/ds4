@@ -382,6 +382,8 @@ typedef struct {
     uint64_t tensor_bytes;
 } ds4_dist_kv_shard_file;
 
+static int g_worker_preconnected_control_fd = -1;
+
 struct ds4_dist_session {
     ds4_dist_coordinator_state state;
     int listen_fd;
@@ -1222,6 +1224,7 @@ static int dist_connect_endpoint_once(const char *host, int port, int *last_errn
     char portbuf[16];
     snprintf(portbuf, sizeof(portbuf), "%d", port);
     if (last_errno) *last_errno = 0;
+    bool connect_debug = getenv("DS4_DIST_CONNECT_DEBUG") != NULL;
 
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
@@ -1239,14 +1242,78 @@ static int dist_connect_endpoint_once(const char *host, int port, int *last_errn
     int fd = -1;
     int saved_errno = 0;
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        char ai_host[NI_MAXHOST] = {0};
+        char ai_port[NI_MAXSERV] = {0};
+        if (connect_debug) {
+            getnameinfo(ai->ai_addr, ai->ai_addrlen,
+                        ai_host, sizeof(ai_host),
+                        ai_port, sizeof(ai_port),
+                        NI_NUMERICHOST | NI_NUMERICSERV);
+        }
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) {
             saved_errno = errno;
+            if (connect_debug) {
+                fprintf(stderr,
+                        "ds4: distributed connect debug: socket family=%d %s:%s failed: %s\n",
+                        ai->ai_family, ai_host, ai_port, strerror(saved_errno));
+            }
             continue;
         }
-        dist_set_socket_low_latency(fd);
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        const char *bind_host = getenv("DS4_DIST_CONNECT_BIND_HOST");
+        if (bind_host && bind_host[0]) {
+            struct addrinfo bhints;
+            memset(&bhints, 0, sizeof(bhints));
+            bhints.ai_family = ai->ai_family;
+            bhints.ai_socktype = ai->ai_socktype;
+            struct addrinfo *bres = NULL;
+            int bgai = getaddrinfo(bind_host, "0", &bhints, &bres);
+            if (bgai == 0 && bres) {
+                if (bind(fd, bres->ai_addr, bres->ai_addrlen) != 0) {
+                    saved_errno = errno;
+                    if (connect_debug) {
+                        fprintf(stderr,
+                                "ds4: distributed connect debug: bind source %s failed: %s\n",
+                                bind_host, strerror(saved_errno));
+                    }
+                    freeaddrinfo(bres);
+                    close(fd);
+                    fd = -1;
+                    continue;
+                }
+                freeaddrinfo(bres);
+            } else {
+                if (connect_debug) {
+                    fprintf(stderr,
+                            "ds4: distributed connect debug: bind source getaddrinfo(%s): %s\n",
+                            bind_host, gai_strerror(bgai));
+                }
+                if (bres) freeaddrinfo(bres);
+            }
+        }
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
+            dist_set_socket_low_latency(fd);
+            break;
+        }
         saved_errno = errno;
+        if (connect_debug) {
+            char local_host[NI_MAXHOST] = {0};
+            char local_port[NI_MAXSERV] = {0};
+            struct sockaddr_storage lss;
+            socklen_t llen = sizeof(lss);
+            if (getsockname(fd, (struct sockaddr *)&lss, &llen) == 0) {
+                getnameinfo((struct sockaddr *)&lss, llen,
+                            local_host, sizeof(local_host),
+                            local_port, sizeof(local_port),
+                            NI_NUMERICHOST | NI_NUMERICSERV);
+            }
+            fprintf(stderr,
+                    "ds4: distributed connect debug: connect family=%d %s:%s fd=%d local=%s:%s failed: %s\n",
+                    ai->ai_family, ai_host, ai_port, fd,
+                    local_host[0] ? local_host : "?",
+                    local_port[0] ? local_port : "?",
+                    strerror(saved_errno));
+        }
         close(fd);
         fd = -1;
     }
@@ -1270,6 +1337,41 @@ static int dist_connect_endpoint(const char *host, int port, char *err, size_t e
         nanosleep(&ts, NULL);
     }
     return -1;
+}
+
+int ds4_dist_worker_preconnect_control(
+        const ds4_dist_options *opt,
+        char *err,
+        size_t errlen) {
+    if (!opt || opt->role != DS4_DISTRIBUTED_WORKER) return 0;
+    if (g_worker_preconnected_control_fd >= 0) return 0;
+    if (!opt->coordinator_host || opt->coordinator_port <= 0) {
+        if (errlen) snprintf(err, errlen, "worker preconnect requires --coordinator HOST PORT");
+        return 1;
+    }
+
+    signal(SIGPIPE, SIG_IGN);
+    fprintf(stderr,
+            "ds4: distributed worker: preconnecting control channel to coordinator %s:%d before model load\n",
+            opt->coordinator_host,
+            opt->coordinator_port);
+    for (;;) {
+        int fd = dist_connect_endpoint(opt->coordinator_host, opt->coordinator_port, err, errlen);
+        if (fd >= 0) {
+            g_worker_preconnected_control_fd = fd;
+            char peer_host[NI_MAXHOST], peer_port[NI_MAXSERV];
+            dist_peer_name(fd, peer_host, sizeof(peer_host), peer_port, sizeof(peer_port));
+            fprintf(stderr,
+                    "ds4: distributed worker: preconnected control channel to coordinator %s:%s\n",
+                    peer_host,
+                    peer_port);
+            return 0;
+        }
+        fprintf(stderr,
+                "ds4: distributed worker: %s; retrying before model load\n",
+                err && err[0] ? err : "unable to connect to coordinator");
+        dist_sleep_reconnect();
+    }
 }
 
 /* =========================================================================
@@ -2088,7 +2190,9 @@ static bool dist_coordinator_build_route_plan(
         entry.layer_start = w->layer_start;
         entry.layer_end = w->layer_end;
         entry.flags = w->has_output ? DS4_DIST_ROUTE_F_OUTPUT_LOGITS : 0u;
-        if (state->use_control_for_work && plan->count == 0) {
+        if (state->use_control_for_work &&
+            getenv("DS4_DIST_DISABLE_CONTROL_WORK") == NULL &&
+            plan->count == 0) {
             entry.fd = dup(w->fd);
             if (entry.fd < 0) {
                 pthread_mutex_unlock(&state->mu);
@@ -2364,6 +2468,15 @@ static int dist_coordinator_send_remote_work_on_fd(
     work.route_index = 0;
     work.route_bytes = plan->blob_bytes;
 
+    DIST_COORD_DEBUG(state,
+                     "ds4: distributed coordinator: sending WORK request=%llu fd=%d layers=%u:%u pos=%u tokens=%u hidden_bytes=%u\n",
+                     (unsigned long long)request_id,
+                     fd,
+                     work.layer_start,
+                     work.layer_end,
+                     pos0,
+                     n_tokens,
+                     wire_hidden_hc_bytes);
     if (dist_send_work_frame(fd, &work, tokens, hidden_hc, plan->blob) != 0) {
         if (errlen) snprintf(err, errlen, "failed to send distributed work");
         return 1;
@@ -2506,9 +2619,23 @@ static int dist_coordinator_eval_span(
         const ds4_dist_route_entry *first = &plan->entry[0];
         remote_fd = first->fd;
         if (remote_fd < 0) {
-            if (errlen) snprintf(err, errlen, "distributed route has no live first-hop connection");
-            free(hidden);
-            return 1;
+            remote_fd = dist_connect_endpoint(first->host, first->port, err, errlen);
+            if (remote_fd < 0) {
+                char saved[256];
+                snprintf(saved, sizeof(saved), "%s", err && err[0] ? err : "unknown error");
+                if (errlen) {
+                    snprintf(err, errlen,
+                             "distributed route could not connect first-hop data socket %s:%u: %s",
+                             first->host, first->port, saved);
+                }
+                free(hidden);
+                return 1;
+            }
+            DIST_COORD_DEBUG(state,
+                             "ds4: distributed coordinator: connected first-hop data socket %s:%u for request %llu\n",
+                             first->host,
+                             first->port,
+                             (unsigned long long)request_id);
         }
     }
 
@@ -2524,6 +2651,14 @@ static int dist_coordinator_eval_span(
                                           local_logits ? logits : NULL,
                                           err,
                                           errlen);
+    if (rc != 0) {
+        DIST_COORD_DEBUG(state,
+                         "ds4: distributed coordinator: local layer slice failed request=%llu pos=%u tokens=%u: %s\n",
+                         (unsigned long long)request_id,
+                         pos0,
+                         n_tokens,
+                         err && err[0] ? err : "unknown error");
+    }
     if (rc == 0 && plan->count != 0) {
         rc = dist_coordinator_eval_remote_on_fd(state,
                                                 session,
@@ -2542,7 +2677,18 @@ static int dist_coordinator_eval_span(
                                                 logits,
                                                 err,
                                                 errlen);
+        if (rc != 0) {
+            DIST_COORD_DEBUG(state,
+                             "ds4: distributed coordinator: remote route failed request=%llu pos=%u tokens=%u via %s:%u: %s\n",
+                             (unsigned long long)request_id,
+                             pos0,
+                             n_tokens,
+                             plan->entry[0].host,
+                             plan->entry[0].port,
+                             err && err[0] ? err : "unknown error");
+        }
     }
+    if (plan->count != 0 && plan->entry[0].fd < 0 && remote_fd >= 0) close(remote_fd);
     free(hidden);
     return rc;
 }
@@ -3881,32 +4027,6 @@ static void dist_coordinator_remove_worker(ds4_dist_coordinator_state *state, in
     pthread_mutex_unlock(&state->mu);
 }
 
-static void dist_coordinator_monitor_worker_fd(
-        ds4_dist_coordinator_state *state,
-        int fd,
-        const char *peer_host,
-        const char *peer_port) {
-    for (;;) {
-        struct pollfd pfd = {
-            .fd = fd,
-            .events = 0,
-            .revents = 0,
-        };
-        int rc = poll(&pfd, 1, 1000);
-        if (rc < 0) {
-            if (errno == EINTR) continue;
-            DIST_COORD_DEBUG(state,
-                             "ds4: distributed coordinator: worker %s:%s poll failed: %s\n",
-                             peer_host,
-                             peer_port,
-                             strerror(errno));
-            break;
-        }
-        if (rc == 0) continue;
-        if ((pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0) break;
-    }
-}
-
 static void *dist_coordinator_client_main(void *arg) {
     ds4_dist_client_ctx *ctx = arg;
     int fd = ctx->fd;
@@ -3917,15 +4037,28 @@ static void *dist_coordinator_client_main(void *arg) {
     snprintf(peer_port, sizeof(peer_port), "%s", ctx->peer_port);
     free(ctx);
 
+    /* Workers may preconnect their control socket before loading large Metal
+     * slices, then send HELLO only after model initialization. Do not let the
+     * accepted socket's normal I/O timeout close that startup connection. */
+    struct timeval no_timeout = {0, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &no_timeout, sizeof(no_timeout));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &no_timeout, sizeof(no_timeout));
+
     ds4_dist_hello_fixed hello;
     char model_name[DS4_DIST_MAX_MODEL_NAME + 1u];
     char err[256];
     int rc = dist_recv_hello(fd, &hello, model_name, sizeof(model_name), err, sizeof(err));
     if (rc <= 0) {
-        if (rc < 0) DIST_COORD_DEBUG(state, "ds4: distributed coordinator: bad HELLO from %s:%s: %s\n", peer_host, peer_port, err);
+        DIST_COORD_DEBUG(state,
+                         "ds4: distributed coordinator: bad/closed HELLO from %s:%s rc=%d %s\n",
+                         peer_host,
+                         peer_port,
+                         rc,
+                         rc < 0 ? err : "connection closed");
         close(fd);
         return NULL;
     }
+    dist_set_socket_low_latency(fd);
 
     if (hello.model_id != state->model_id) {
         snprintf(err, sizeof(err), "model id mismatch: worker=%u coordinator=%u", hello.model_id, state->model_id);
@@ -4016,7 +4149,22 @@ static void *dist_coordinator_client_main(void *arg) {
     dist_coordinator_add_worker(state, fd, peer_host, peer_port, &hello, model_name);
 
     if (state->use_control_for_work) {
-        dist_coordinator_monitor_worker_fd(state, fd, peer_host, peer_port);
+        /* One-shot coordinator generation duplicates the first-hop worker's
+         * control fd and uses the duplicate for WORK/RESULT frames.  Do not
+         * let the registration thread remove the worker while generation is
+         * active: poll() on the original fd can observe transient readiness /
+         * hangup state while the duplicate is doing real work, which races the
+         * route-ready wait in the CLI.  The generation path owns failure
+         * handling through the duplicated route fd, and the process exits when
+         * the one-shot request completes. */
+        for (;;) {
+            pthread_mutex_lock(&state->mu);
+            bool shutting_down = state->shutting_down;
+            pthread_mutex_unlock(&state->mu);
+            if (shutting_down) break;
+            struct timespec ts = {0, 100 * 1000 * 1000};
+            nanosleep(&ts, NULL);
+        }
     } else {
         for (;;) {
             uint32_t type = 0, bytes = 0;
@@ -5545,8 +5693,17 @@ static int dist_worker_read_loop(ds4_dist_worker_state *state, int fd) {
             break;
         }
         if (type == DS4_DIST_MSG_WORK) {
+            if (getenv("DS4_DIST_WORKER_DEBUG") != NULL) {
+                fprintf(stderr,
+                        "ds4: distributed worker: received WORK frame bytes=%u\n",
+                        bytes);
+            }
             rc = dist_worker_handle_work(state, &upstream, bytes);
             if (rc <= 0) {
+                fprintf(stderr,
+                        "ds4: distributed worker: WORK handler ended rc=%d bytes=%u\n",
+                        rc,
+                        bytes);
                 loop_rc = rc == 0 ? 0 : 1;
                 break;
             }
@@ -7260,6 +7417,14 @@ static int dist_worker_process_work_payload(
                eval_rc);
 
     if (eval_rc != 0) {
+        fprintf(stderr,
+                "ds4: distributed worker: eval failed request=%llu layers=%u:%u tokens=%u pos=%u: %s\n",
+                (unsigned long long)request_id,
+                work.layer_start,
+                work.layer_end,
+                work.n_tokens,
+                work.pos0,
+                err[0] ? err : "unknown error");
         if (!input_hc_uses_wire) free(input_hc);
         free(result);
         free(route_blob);
@@ -7615,6 +7780,18 @@ static void *dist_worker_data_listener_main(void *arg) {
             continue;
         }
         dist_set_socket_low_latency(fd);
+        char peer_host[NI_MAXHOST] = {0};
+        char peer_port[NI_MAXSERV] = {0};
+        getnameinfo((struct sockaddr *)&ss, slen,
+                    peer_host, sizeof(peer_host),
+                    peer_port, sizeof(peer_port),
+                    NI_NUMERICHOST | NI_NUMERICSERV);
+        if (getenv("DS4_DIST_WORKER_DEBUG") != NULL) {
+            fprintf(stderr,
+                    "ds4: distributed worker: accepted data connection from %s:%s\n",
+                    peer_host[0] ? peer_host : "?",
+                    peer_port[0] ? peer_port : "?");
+        }
 
         ds4_dist_data_client_ctx *ctx = calloc(1, sizeof(*ctx));
         if (!ctx) {
@@ -7699,11 +7876,17 @@ static int dist_run_worker(ds4_engine *engine, const ds4_dist_options *opt, int 
             opt->coordinator_port);
 
     for (;;) {
-        int fd = dist_connect_endpoint(opt->coordinator_host, opt->coordinator_port, err, sizeof(err));
-        if (fd < 0) {
-            fprintf(stderr, "ds4: distributed worker: %s; retrying\n", err);
-            dist_sleep_reconnect();
-            continue;
+        int fd = -1;
+        if (g_worker_preconnected_control_fd >= 0) {
+            fd = g_worker_preconnected_control_fd;
+            g_worker_preconnected_control_fd = -1;
+        } else {
+            fd = dist_connect_endpoint(opt->coordinator_host, opt->coordinator_port, err, sizeof(err));
+            if (fd < 0) {
+                fprintf(stderr, "ds4: distributed worker: %s; retrying\n", err);
+                dist_sleep_reconnect();
+                continue;
+            }
         }
 
         char peer_host[NI_MAXHOST], peer_port[NI_MAXSERV];
@@ -7721,11 +7904,16 @@ static int dist_run_worker(ds4_engine *engine, const ds4_dist_options *opt, int 
             ? dist_worker_read_loop(&state, fd)
             : dist_worker_read_loop_prefetch(&state, fd);
         close(fd);
-        uint32_t dropped_sessions = dist_worker_clear_sessions(&state);
-        if (dropped_sessions) {
+        if (getenv("DS4_DIST_KEEP_SESSIONS_ON_RECONNECT") == NULL) {
+            uint32_t dropped_sessions = dist_worker_clear_sessions(&state);
+            if (dropped_sessions) {
+                fprintf(stderr,
+                        "ds4: distributed worker: cleared %u sessions after coordinator disconnect\n",
+                        dropped_sessions);
+            }
+        } else {
             fprintf(stderr,
-                    "ds4: distributed worker: cleared %u sessions after coordinator disconnect\n",
-                    dropped_sessions);
+                    "ds4: distributed worker: keeping sessions after coordinator disconnect\n");
         }
         fprintf(stderr, "ds4: distributed worker: coordinator disconnected%s; reconnecting\n",
                 rc ? " after error" : "");

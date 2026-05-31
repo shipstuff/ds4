@@ -62,6 +62,16 @@ int ds4_dist_prepare_engine_options(
         char *err,
         size_t errlen);
 
+/* Worker-only: open the coordinator control connection before the model is
+ * loaded, then ds4_dist_run() consumes it after engine initialization and sends
+ * the normal HELLO. This avoids opening the first outbound socket after large
+ * Metal model mappings on macOS.
+ */
+int ds4_dist_worker_preconnect_control(
+        const ds4_dist_options *opt,
+        char *err,
+        size_t errlen);
+
 /* Coordinator session backend used by ds4.c. These mirror the normal session
  * operations; callers outside the engine should not need to call them directly.
  */
