@@ -1045,7 +1045,7 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
         "## Notes",
         "",
         "- DS4 baseline REPL keeps the full live KV session and only syncs new suffix tokens on follow-up turns.",
-        "- SpecPrefill `fresh` mode recompresses the full canonical transcript each turn, then syncs the compressed target view.",
+        "- SpecPrefill cache behavior is controlled by `--spec-prefill-cache`: `reuse` warm-extends target KV between recompresses; `fresh` recompresses the full canonical transcript every turn.",
         "- Use `metrics.csv` for the TTFT breakdown columns (`drafter_ms`, `target_prefill_ms`, `first_decode_ms`) and suffix/sync counts.",
         "",
     ]
@@ -1119,8 +1119,12 @@ def main() -> int:
                     default="/Users/Shared/models/ds4-gguf/dsv4-tokenizer")
     ap.add_argument("--drafter-lib",
                     default="/Users/carl/projects/anemll-project/scripts/heterogeneous")
-    ap.add_argument("--spec-prefill-cache", choices=["fresh", "reuse"],
-                    help="Optional cache mode for --modes drafter.")
+    ap.add_argument("--spec-prefill-cache", choices=["fresh", "reuse"], default="reuse",
+                    help="Cache mode for --modes drafter. Harness default is reuse so "
+                         "baseline-vs-drafter chat-loop comparisons use warm REPL semantics.")
+    ap.add_argument("--allow-fresh-drafter-comparison", action="store_true",
+                    help="Allow --modes baseline drafter with --spec-prefill-cache fresh. "
+                         "Without this, the harness rejects that apples-to-oranges chat comparison.")
     ap.add_argument("--external-python", default=sys.executable,
                     help="Python executable for --modes external scorer.")
     ap.add_argument("--external-scorer-script", default="speed-bench/align_mlx_scores_to_dsv4.py",
@@ -1162,6 +1166,22 @@ def main() -> int:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if (
+        "baseline" in args.modes and
+        "drafter" in args.modes and
+        args.spec_prefill_cache == "fresh" and
+        not args.allow_fresh_drafter_comparison
+    ):
+        print(
+            "error: refusing baseline-vs-drafter chat comparison with "
+            "--spec-prefill-cache fresh. Baseline reuses live KV across turns, "
+            "while fresh drafter invalidates and recompresses the full transcript "
+            "every turn. Use --spec-prefill-cache reuse for actual chat-loop "
+            "comparison, or pass --allow-fresh-drafter-comparison for a diagnostic run.",
+            file=sys.stderr,
+        )
+        return 2
 
     if args.report_only_metrics:
         all_metrics = read_metrics_csv(Path(args.report_only_metrics))
