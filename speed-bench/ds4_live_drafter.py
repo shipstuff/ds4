@@ -5,6 +5,10 @@ Protocol on stdin/stdout:
   SCORE <expected_ds4_tokens> <utf8_byte_len>\n
   <rendered transcript bytes>
 
+  SCORE2 <expected_ds4_tokens> <utf8_byte_len>\n
+  <rendered transcript bytes>
+  <expected_ds4_tokens pairs of little-endian uint32 byte start/end offsets>
+
 Response:
   OK <n_scores> <total_ms> <tokenize_ms> <score_ms> <align_ms>\n
   <n_scores little-endian float32 values>
@@ -18,6 +22,7 @@ from __future__ import annotations
 import argparse
 import array
 import bisect
+import struct
 import sys
 import time
 from pathlib import Path
@@ -57,10 +62,28 @@ def normalize(scores):
     return [(s - smin) / span for s in scores]
 
 
+def byte_spans_to_char_spans(text: str, byte_spans):
+    byte_len = len(text.encode("utf-8"))
+    byte_to_char = [0] * (byte_len + 1)
+    pos = 0
+    for i, ch in enumerate(text):
+        n = len(ch.encode("utf-8"))
+        for j in range(n):
+            byte_to_char[pos + j] = i
+        pos += n
+        byte_to_char[pos] = i + 1
+    out = []
+    for a, b in byte_spans:
+        a = max(0, min(byte_len, int(a)))
+        b = max(0, min(byte_len, int(b)))
+        out.append((byte_to_char[a], byte_to_char[b]))
+    return out
+
+
 class FakeScorer:
-    def score(self, text: str, expected: int):
+    def score(self, text: str, expected: int, ds4_byte_offsets=None):
         # Test-only deterministic shape: later tokens score slightly higher.
-        del text
+        del text, ds4_byte_offsets
         if expected <= 0:
             return [], (0.0, 0.0, 0.0)
         return [i / max(1, expected - 1) for i in range(expected)], (0.0, 0.0, 0.0)
@@ -92,13 +115,16 @@ class MlxScorer:
         mx.eval(self.model.parameters())
         print(f"ds4-live-drafter: ready in {time.perf_counter() - t0:.2f}s", file=sys.stderr, flush=True)
 
-    def score(self, text: str, expected: int):
+    def score(self, text: str, expected: int, ds4_byte_offsets=None):
         t0 = time.perf_counter()
         scorer_enc = self.scorer_tk(text, return_offsets_mapping=True, add_special_tokens=False)
-        dsv4_enc = self.dsv4_tk(text, return_offsets_mapping=True, add_special_tokens=False)
         scorer_ids = scorer_enc["input_ids"]
         scorer_offsets = list(scorer_enc["offset_mapping"])
-        dsv4_offsets = list(dsv4_enc["offset_mapping"])
+        if ds4_byte_offsets is not None:
+            dsv4_offsets = byte_spans_to_char_spans(text, ds4_byte_offsets)
+        else:
+            dsv4_enc = self.dsv4_tk(text, return_offsets_mapping=True, add_special_tokens=False)
+            dsv4_offsets = list(dsv4_enc["offset_mapping"])
         t1 = time.perf_counter()
 
         prompt = self.mx.array(scorer_ids, dtype=self.mx.uint32)
@@ -124,7 +150,7 @@ class MlxScorer:
         dsv4_scores = normalize(realign_to_dsv4(scorer_scores, scorer_offsets, dsv4_offsets))
         if len(dsv4_scores) != expected:
             raise ValueError(
-                f"dsv4 tokenizer produced {len(dsv4_scores)} tokens, expected DS4 transcript has {expected}"
+                f"aligned scorer produced {len(dsv4_scores)} tokens, expected DS4 transcript has {expected}"
             )
         t3 = time.perf_counter()
         return dsv4_scores, ((t1 - t0) * 1000.0, (t2 - t1) * 1000.0, (t3 - t2) * 1000.0)
@@ -172,7 +198,7 @@ def main() -> int:
             return 0
         try:
             op, expected_s, nbytes_s = line_s.split()
-            if op != "SCORE":
+            if op not in {"SCORE", "SCORE2"}:
                 raise ValueError(f"unknown op {op}")
             expected = int(expected_s)
             nbytes = int(nbytes_s)
@@ -180,7 +206,14 @@ def main() -> int:
             if len(payload) != nbytes:
                 raise ValueError(f"short prompt payload {len(payload)}/{nbytes}")
             text = payload.decode("utf-8")
-            scores, timings = scorer.score(text, expected)
+            ds4_offsets = None
+            if op == "SCORE2":
+                raw_spans = stdin.read(expected * 8)
+                if len(raw_spans) != expected * 8:
+                    raise ValueError(f"short span payload {len(raw_spans)}/{expected * 8}")
+                vals = struct.unpack("<" + "II" * expected, raw_spans)
+                ds4_offsets = list(zip(vals[0::2], vals[1::2]))
+            scores, timings = scorer.score(text, expected, ds4_offsets)
             send_scores(scores, timings)
         except Exception as exc:  # keep the resident helper alive for debuggability
             send_error(str(exc))

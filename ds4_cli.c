@@ -1482,23 +1482,35 @@ static int write_all_fd(int fd, const void *buf, size_t len) {
     return 0;
 }
 
-static char *render_tokens_text(ds4_engine *engine, const ds4_tokens *tokens, size_t *out_len) {
+static char *render_tokens_text(ds4_engine *engine, const ds4_tokens *tokens,
+                                size_t *out_len, uint32_t **spans_out) {
     size_t len = 0;
     size_t cap = 4096;
     char *buf = malloc(cap);
     if (!buf) return NULL;
+    uint32_t *spans = NULL;
+    if (spans_out) {
+        spans = malloc((size_t)tokens->len * 2u * sizeof(spans[0]));
+        if (!spans) {
+            free(buf);
+            return NULL;
+        }
+    }
     for (int i = 0; i < tokens->len; i++) {
         size_t piece_len = 0;
         char *piece = ds4_token_text(engine, tokens->v[i], &piece_len);
         if (!piece && piece_len > 0) {
+            free(spans);
             free(buf);
             return NULL;
         }
+        const size_t start = len;
         if (len + piece_len + 1 > cap) {
             while (len + piece_len + 1 > cap) cap *= 2;
             char *next = realloc(buf, cap);
             if (!next) {
                 free(piece);
+                free(spans);
                 free(buf);
                 return NULL;
             }
@@ -1506,10 +1518,15 @@ static char *render_tokens_text(ds4_engine *engine, const ds4_tokens *tokens, si
         }
         if (piece_len > 0) memcpy(buf + len, piece, piece_len);
         len += piece_len;
+        if (spans) {
+            spans[(size_t)i * 2u + 0u] = start > UINT32_MAX ? UINT32_MAX : (uint32_t)start;
+            spans[(size_t)i * 2u + 1u] = len > UINT32_MAX ? UINT32_MAX : (uint32_t)len;
+        }
         free(piece);
     }
     buf[len] = '\0';
     if (out_len) *out_len = len;
+    if (spans_out) *spans_out = spans;
     return buf;
 }
 
@@ -1619,23 +1636,28 @@ static int cli_live_drafter_score(cli_config *cfg, ds4_engine *engine,
     if (cli_live_drafter_start(cfg, err, errlen) != 0) return -1;
 
     size_t text_len = 0;
-    char *text = render_tokens_text(engine, prompt, &text_len);
+    uint32_t *spans = NULL;
+    char *text = render_tokens_text(engine, prompt, &text_len, &spans);
     if (!text) {
         snprintf(err, errlen, "live drafter failed to render transcript");
         return -1;
     }
 
     char header[128];
-    int header_len = snprintf(header, sizeof(header), "SCORE %d %zu\n",
+    int header_len = snprintf(header, sizeof(header), "SCORE2 %d %zu\n",
                               prompt->len, text_len);
     if (header_len <= 0 || (size_t)header_len >= sizeof(header) ||
         write_all_fd(cfg->drafter.in_fd, header, (size_t)header_len) != 0 ||
-        write_all_fd(cfg->drafter.in_fd, text, text_len) != 0) {
+        write_all_fd(cfg->drafter.in_fd, text, text_len) != 0 ||
+        write_all_fd(cfg->drafter.in_fd, spans,
+                     (size_t)prompt->len * 2u * sizeof(spans[0])) != 0) {
         free(text);
+        free(spans);
         snprintf(err, errlen, "live drafter request write failed: %s", strerror(errno));
         return -1;
     }
     free(text);
+    free(spans);
 
     char line[256];
     if (!fgets(line, sizeof(line), cfg->drafter.out_fp)) {
