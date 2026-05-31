@@ -184,9 +184,9 @@ def build_modes(args) -> list[ModeRun]:
                 "--spec-prefill-sink", str(args.sink),
                 "--spec-prefill-tail", str(args.tail),
                 "--spec-prefill-chunk", str(args.chunk),
-                # External score files are generated for the cold first turn.
-                # Reuse mode lets follow-up chat turns warm-extend without
-                # requiring a stale score vector for the larger transcript.
+                # External score files are generated for the first cold prompt;
+                # keep this path reuse-only because it cannot score the larger
+                # generated transcript on later turns.
                 "--spec-prefill-cache", "reuse",
             ],
             needs_external_scores=True,
@@ -205,8 +205,7 @@ def build_modes(args) -> list[ModeRun]:
             "--spec-prefill-drafter-tokenizer", args.drafter_tokenizer,
             "--spec-prefill-drafter-lib", args.drafter_lib,
         ]
-        if args.spec_prefill_cache:
-            extra += ["--spec-prefill-cache", args.spec_prefill_cache]
+        extra += ["--spec-prefill-cache", args.spec_prefill_cache]
         modes.append(ModeRun("drafter", extra))
     return modes
 
@@ -618,6 +617,20 @@ def feed_repl(
             for i, turn in enumerate(turns):
                 if i > 0:
                     drain_stderr_available()
+                if args.chat_cache == "cold-full-prompt" and i > 0:
+                    # Match mini-01's `--mode cold --chat-loop`: keep the
+                    # model process resident, but reset the live KV session
+                    # before each follow-up. The DS4 transcript is preserved,
+                    # so the next turn prefills the full accumulated prompt.
+                    if not stdin_write(f"/ctx {args.ctx}\n"):
+                        exit_code = proc.returncode if proc.poll() is not None else "<still running, pipe closed>"
+                        print(
+                            f"  [warn] ds4 stdin closed before /ctx reset for turn {i} "
+                            f"(exit={exit_code}); stopping after captured turns",
+                            file=sys.stderr,
+                        )
+                        break
+                    drain_stderr_available(0.75)
                 current = TurnMetrics(mode=mode.label, turn=i, depth=depth)
                 t_started = time.perf_counter()
                 deadline = time.monotonic() + args.timeout
@@ -856,15 +869,17 @@ def maybe_plot(metrics: list[TurnMetrics], out_dir: Path) -> bool:
         return m.transcript_tokens or m.canonical_tokens or m.prompt_tokens or m.turn
 
     def plot_value(m: TurnMetrics, attr: str):
+        is_full_sync = (
+            m.suffix_tokens is not None and
+            m.canonical_tokens is not None and
+            m.suffix_tokens == m.canonical_tokens
+        )
+        is_recompress = m.compressed_tokens is not None
         if attr == "ttft_ms":
-            if (m.mode == "baseline" and m.suffix_tokens is not None and
-                    m.canonical_tokens is not None and
-                    m.suffix_tokens != m.canonical_tokens):
+            if not (is_full_sync or is_recompress):
                 return None
         if attr == "effective_prompt_tps":
-            if (m.mode == "baseline" and m.suffix_tokens is not None and
-                    m.canonical_tokens is not None and
-                    m.suffix_tokens != m.canonical_tokens):
+            if not (is_full_sync or is_recompress):
                 return None
         return getattr(m, attr)
 
@@ -941,22 +956,25 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
 
     def chart_value(m: TurnMetrics, attr: str):
         if attr == "ttft_ms":
-            # Baseline follow-up turns are warm suffix-prefill timings, not
-            # full-context TTFT at the x-axis context size.  Keep them in the
-            # table with the suffix count, but do not plot them as if they were
-            # comparable full-context points.
-            if (m.mode == "baseline" and m.suffix_tokens is not None and
-                    m.canonical_tokens is not None and
-                    m.suffix_tokens != m.canonical_tokens):
+            # Warm suffix-prefill timings are not full-context TTFT at the
+            # x-axis context size. Keep them in the table with suffix counts,
+            # but only plot full-sync or SpecPrefill recompress events.
+            is_full_sync = (
+                m.suffix_tokens is not None and
+                m.canonical_tokens is not None and
+                m.suffix_tokens == m.canonical_tokens
+            )
+            is_recompress = m.compressed_tokens is not None
+            if not (is_full_sync or is_recompress):
                 return None
         if attr == "effective_prompt_tps":
-            # Baseline follow-up turns reuse KV and only prefill the suffix.
-            # canonical_tokens / TTFT is useful for a cold prompt, but it is
-            # misleading for warm baseline turns because canonical_tokens
-            # includes already-resident context.
-            if (m.mode == "baseline" and m.suffix_tokens is not None and
-                    m.canonical_tokens is not None and
-                    m.suffix_tokens != m.canonical_tokens):
+            is_full_sync = (
+                m.suffix_tokens is not None and
+                m.canonical_tokens is not None and
+                m.suffix_tokens == m.canonical_tokens
+            )
+            is_recompress = m.compressed_tokens is not None
+            if not (is_full_sync or is_recompress):
                 return None
         return getattr(m, attr)
 
@@ -970,7 +988,7 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
         fig, axes = plt.subplots(3, 1, figsize=(8.5, 9.0), dpi=140, sharex=True)
         specs = [
             ("gen_tps", "Decode tok/s"),
-            ("ttft_ms", "Comparable TTFT ms"),
+            ("effective_prompt_tps", "Effective prompt tok/s"),
             ("wall_s", "Full turn wall time s"),
         ]
         for ax, (attr, ylabel) in zip(axes, specs):
@@ -1014,11 +1032,12 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
         "- `suffix` = tokens actually prefetched/synced for the turn after KV common-prefix reuse.",
         "- `generated` = tokens emitted into the live DS4 session during the turn.",
         "- `TTFT` = chat turn start to first emitted token; DS4 breakdown includes drafter, compression, target prefill, and first decode.",
-        "- Baseline follow-up `TTFT` values are warm suffix-prefill timings; the main TTFT chart omits them instead of plotting 1-2s as full-context baseline points.",
+        "- Default benchmark semantics match mini-01: the model process stays loaded, but `/ctx` resets live KV before each follow-up so each turn prefills the full accumulated transcript.",
+        "- Warm follow-up `TTFT` values, when explicitly requested with `--chat-cache warm-repl`, are suffix-prefill timings; TTFT charts omit them unless the turn did a full sync or SpecPrefill recompress.",
         "- `wall time` = full scripted turn time, including the complete generated response.",
         "- `decode tok/s` = emitted tokens / decode elapsed after prefill.",
         "- Chart x-axis is total logical context tokens, matching the mini-01 Qwen revalidation style.",
-        "- Baseline follow-up TTFT is warm-continuation TTFT: the prior context is resident in KV and only the new suffix is synced. Use `suffix` to verify this.",
+        "- `--chat-cache warm-repl` keeps live KV across turns and is not the mini-01 comparison.",
         "",
         "## Per-Turn Measurements",
         "",
@@ -1031,7 +1050,7 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
         f"{base_label} target ctx",
         f"{base_label} suffix",
         f"{base_label} generated",
-        f"{base_label} warm TTFT ms",
+        f"{base_label} TTFT ms",
         f"{base_label} wall s",
         f"{base_label} decode tok/s",
         f"{sp_label} ctx",
@@ -1082,8 +1101,8 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
         "",
         "## Notes",
         "",
-        "- DS4 baseline REPL keeps the full live KV session and only syncs new suffix tokens on follow-up turns.",
-        "- SpecPrefill cache behavior is controlled by `--spec-prefill-cache`: `reuse` warm-extends target KV between recompresses; `fresh` recompresses the full canonical transcript every turn.",
+        "- Default `--chat-cache cold-full-prompt` matches the mini-01 Qwen harness: reset KV between turns while keeping the model process loaded.",
+        "- SpecPrefill cache behavior is controlled by `--spec-prefill-cache`: default `fresh` recompresses the full canonical transcript every turn; `reuse` warm-extends target KV between recompresses.",
         "- Use `metrics.csv` for the TTFT breakdown columns (`drafter_ms`, `target_prefill_ms`, `first_decode_ms`) and suffix/sync counts.",
         "",
     ]
@@ -1157,12 +1176,18 @@ def main() -> int:
                     default="/Users/Shared/models/ds4-gguf/dsv4-tokenizer")
     ap.add_argument("--drafter-lib",
                     default="/Users/carl/projects/anemll-project/scripts/heterogeneous")
-    ap.add_argument("--spec-prefill-cache", choices=["fresh", "reuse"], default="reuse",
-                    help="Cache mode for --modes drafter. Harness default is reuse so "
-                         "baseline-vs-drafter chat-loop comparisons use warm REPL semantics.")
+    ap.add_argument("--spec-prefill-cache", choices=["fresh", "reuse"], default="fresh",
+                    help="Cache mode for --modes drafter. Default fresh matches "
+                         "mini-01: score/compress the full canonical transcript "
+                         "every turn.")
+    ap.add_argument("--chat-cache", choices=["cold-full-prompt", "warm-repl"],
+                    default="cold-full-prompt",
+                    help="Chat-loop cache semantics. cold-full-prompt resets DS4 "
+                         "KV with /ctx before each follow-up while preserving the "
+                         "transcript, matching mini-01 --mode cold --chat-loop. "
+                         "warm-repl keeps live KV across turns.")
     ap.add_argument("--allow-fresh-drafter-comparison", action="store_true",
-                    help="Allow --modes baseline drafter with --spec-prefill-cache fresh. "
-                         "Without this, the harness rejects that apples-to-oranges chat comparison.")
+                    help="Deprecated no-op retained for old scripts.")
     ap.add_argument("--external-python", default=sys.executable,
                     help="Python executable for --modes external scorer.")
     ap.add_argument("--external-scorer-script", default="speed-bench/align_mlx_scores_to_dsv4.py",
@@ -1204,22 +1229,6 @@ def main() -> int:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    if (
-        "baseline" in args.modes and
-        "drafter" in args.modes and
-        args.spec_prefill_cache == "fresh" and
-        not args.allow_fresh_drafter_comparison
-    ):
-        print(
-            "error: refusing baseline-vs-drafter chat comparison with "
-            "--spec-prefill-cache fresh. Baseline reuses live KV across turns, "
-            "while fresh drafter invalidates and recompresses the full transcript "
-            "every turn. Use --spec-prefill-cache reuse for actual chat-loop "
-            "comparison, or pass --allow-fresh-drafter-comparison for a diagnostic run.",
-            file=sys.stderr,
-        )
-        return 2
 
     if args.report_only_metrics:
         all_metrics = read_metrics_csv(Path(args.report_only_metrics))
