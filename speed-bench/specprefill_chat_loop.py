@@ -885,7 +885,7 @@ def maybe_plot(metrics: list[TurnMetrics], out_dir: Path) -> bool:
 
     plots = [
         ("wall_s",            "Per-turn wall time (s)",       "lower is better"),
-        ("effective_prompt_tps", "Effective prompt throughput (t/s)", "full canonical tokens / TTFT"),
+        ("effective_prompt_tps", "Effective prompt tok/s (TTFT throughput)", "full canonical tokens / TTFT"),
         ("ttft_ms",           "TTFT (ms)",                    "lower is better"),
         ("prefill_tps",       "Prefill throughput (t/s)",     "higher is better"),
         ("target_prefill_tps", "Target prefill throughput (t/s)", "actual synced suffix tokens / target prefill"),
@@ -988,7 +988,7 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
         fig, axes = plt.subplots(3, 1, figsize=(8.5, 9.0), dpi=140, sharex=True)
         specs = [
             ("gen_tps", "Decode tok/s"),
-            ("effective_prompt_tps", "Effective prompt tok/s"),
+            ("effective_prompt_tps", "Effective prompt tok/s (TTFT throughput)"),
             ("wall_s", "Full turn wall time s"),
         ]
         for ax, (attr, ylabel) in zip(axes, specs):

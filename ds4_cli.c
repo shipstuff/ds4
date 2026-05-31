@@ -1413,15 +1413,20 @@ static void repl_chat_free(repl_chat *chat) {
 }
 
 static int repl_chat_set_ctx(ds4_engine *engine, repl_chat *chat, int ctx_size) {
-    ds4_session_free(chat->session);
-    chat->session = NULL;
-    chat->ctx_size = 0;
+    if (chat->session && ctx_size == chat->ctx_size) {
+        ds4_session_invalidate(chat->session);
+    } else {
+        ds4_session_free(chat->session);
+        chat->session = NULL;
+        chat->ctx_size = 0;
+    }
     /* New session has empty checkpoint -- force next turn through the
      * cold-compress path of the SpecPrefill chat-loop strategy. */
     chat->transcript_consumed_up_to = 0;
     chat->last_sync_target_tokens = 0;
     chat->last_prefill_suffix_tokens = 0;
     chat->last_compressed_prompt_tokens = 0;
+    if (chat->session) return 0;
     return repl_chat_create_session(engine, chat, ctx_size);
 }
 
