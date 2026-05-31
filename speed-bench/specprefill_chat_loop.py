@@ -808,11 +808,17 @@ def maybe_plot(metrics: list[TurnMetrics], out_dir: Path) -> bool:
         return False
 
     modes = sorted({m.mode for m in metrics})
-    turns = sorted({m.turn for m in metrics})
 
-    def series(mode: str, attr: str) -> list[float]:
-        by_turn = {m.turn: getattr(m, attr) for m in metrics if m.mode == mode}
-        return [by_turn.get(t) for t in turns]
+    def x_context(m: TurnMetrics) -> int:
+        return m.canonical_tokens or m.prompt_tokens or m.turn
+
+    def plot_value(m: TurnMetrics, attr: str):
+        if attr == "effective_prompt_tps":
+            if (m.mode == "baseline" and m.suffix_tokens is not None and
+                    m.canonical_tokens is not None and
+                    m.suffix_tokens != m.canonical_tokens):
+                return None
+        return getattr(m, attr)
 
     plots = [
         ("wall_s",            "Per-turn wall time (s)",       "lower is better"),
@@ -827,13 +833,16 @@ def maybe_plot(metrics: list[TurnMetrics], out_dir: Path) -> bool:
     for attr, title, hint in plots:
         fig, ax = plt.subplots(figsize=(7.0, 4.0), dpi=140)
         for mode in modes:
-            ys = series(mode, attr)
-            xs = [t for t, y in zip(turns, ys) if y is not None]
-            ys = [y for y in ys if y is not None]
+            xs, ys = [], []
+            for m in sorted((m for m in metrics if m.mode == mode), key=x_context):
+                y = plot_value(m, attr)
+                if y is not None:
+                    xs.append(x_context(m))
+                    ys.append(y)
             if not ys:
                 continue
             ax.plot(xs, ys, marker="o", label=mode)
-        ax.set_xlabel("Turn index")
+        ax.set_xlabel("Canonical context tokens before generation")
         ax.set_ylabel(title)
         ax.set_title(f"{title} ({hint})")
         ax.legend(loc="best")
@@ -848,13 +857,16 @@ def maybe_plot(metrics: list[TurnMetrics], out_dir: Path) -> bool:
     if any(m.validate_max_abs is not None for m in metrics):
         fig, ax = plt.subplots(figsize=(7.0, 4.0), dpi=140)
         for mode in modes:
-            ys = series(mode, "validate_max_abs")
-            xs = [t for t, y in zip(turns, ys) if y is not None]
-            ys = [y for y in ys if y is not None]
+            xs, ys = [], []
+            for m in sorted((m for m in metrics if m.mode == mode), key=x_context):
+                y = getattr(m, "validate_max_abs")
+                if y is not None:
+                    xs.append(x_context(m))
+                    ys.append(y)
             if not ys:
                 continue
             ax.plot(xs, ys, marker="o", label=mode)
-        ax.set_xlabel("Turn index")
+        ax.set_xlabel("Canonical context tokens before generation")
         ax.set_ylabel("max | metal-cpu |")
         ax.set_title("CPU vs Metal scorer parity per turn (lower is better)")
         ax.legend(loc="best")
@@ -875,6 +887,9 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
     modes = sorted({m.mode for m in rows})
     turns = sorted({m.turn for m in rows})
     by_mode_turn = {(m.mode, m.turn): m for m in rows}
+
+    def x_context(m: TurnMetrics) -> int:
+        return m.canonical_tokens or m.prompt_tokens or m.turn
 
     def chart_value(m: TurnMetrics, attr: str):
         if attr == "effective_prompt_tps":
@@ -909,13 +924,13 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
                     m = by_mode_turn.get((mode, turn))
                     y = chart_value(m, attr) if m else None
                     if y is not None:
-                        xs.append(turn + 1)
+                        xs.append(x_context(m))
                         ys.append(y)
                 if ys:
                     ax.plot(xs, ys, marker="o", label=mode)
             ax.set_ylabel(ylabel)
             ax.grid(True, alpha=0.3)
-        axes[-1].set_xlabel("Turn")
+        axes[-1].set_xlabel("Canonical context tokens before generation")
         axes[0].set_title(title)
         axes[0].legend(loc="best")
         fig.tight_layout()
@@ -939,6 +954,7 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
         "- `target prefill tok/s` = actual synced suffix tokens / target prefill time.",
         "- `decode tok/s` = emitted tokens / decode elapsed after prefill.",
         "- `ctx` is target KV/session tokens when available; `transcript` is canonical chat tokens.",
+        "- Chart x-axis is canonical prompt/context tokens before generation, not turn index.",
         "- Baseline follow-up `effective prompt tok/s` is omitted from the chart because baseline reuses KV and only prefills the suffix; dividing full canonical context by warm TTFT is not an actual prefill rate.",
         "",
         "## Per-Turn Measurements",
@@ -947,6 +963,7 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
     header = ["turn"]
     for mode in modes:
         header += [
+            f"{mode} prompt ctx",
             f"{mode} transcript",
             f"{mode} ctx",
             f"{mode} sync",
@@ -971,6 +988,7 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
         for mode in modes:
             m = by_mode_turn.get((mode, turn))
             row += [
+                fmt(m.canonical_tokens if m else None, 0),
                 fmt(m.transcript_tokens if m else None, 0),
                 fmt(m.ctx_session_tokens if m else None, 0),
                 fmt(m.sync_tokens if m else None, 0),
