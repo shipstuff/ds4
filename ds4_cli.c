@@ -252,7 +252,7 @@ static void usage(FILE *fp) {
         "Speculative prefill (experimental, dense-decode variant):\n"
         "  --spec-prefill[=KEEP_PCT]\n"
         "      Compress the prompt to KEEP_PCT of its history chunks plus a recent\n"
-        "      tail before prefill. Default KEEP_PCT: 0.3. No-op when prompt length\n"
+        "      tail before prefill. Default KEEP_PCT: 0.2. No-op when prompt length\n"
         "      <= --spec-prefill-tail. Without --spec-prefill-scores, the selection\n"
         "      uses a recency heuristic (NOT real SpecPrefill scoring).\n"
         "  --spec-prefill-sink N\n"
@@ -2281,7 +2281,7 @@ static cli_config parse_options(int argc, char **argv) {
             .dump_logprobs_top_k = 20,
             .think_mode = DS4_THINK_HIGH,
             .spec_prefill_enabled = false,
-            .spec_prefill_keep_pct = 0.3f,
+            .spec_prefill_keep_pct = 0.2f,
             .spec_prefill_sink = 16,
             .spec_prefill_tail = 256,
             .spec_prefill_chunk = 32,

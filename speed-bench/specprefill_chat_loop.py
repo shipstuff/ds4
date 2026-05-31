@@ -1158,7 +1158,7 @@ def main() -> int:
     ap.add_argument("--ctx", type=int, default=32768)
     ap.add_argument("--n-predict", type=int, default=80)
     ap.add_argument("--temp", type=float, default=0.0)
-    ap.add_argument("--keep-pct", type=float, default=0.3)
+    ap.add_argument("--keep-pct", type=float, default=0.2)
     ap.add_argument("--sink", type=int, default=16)
     ap.add_argument("--tail", type=int, default=256)
     ap.add_argument("--chunk", type=int, default=32)

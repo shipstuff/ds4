@@ -293,7 +293,7 @@ const ds4_tokens *ds4_session_tokens(ds4_session *s);
  * let local agent sessions opt into smaller prefills on long prompts. */
 typedef struct {
     /* Fraction of history chunks to keep, in (0, 1].  1.0 disables selection
-     * (returns prompt unchanged).  Default 0.3. */
+     * (returns prompt unchanged).  Default 0.2. */
     float keep_pct;
 
     /* Number of leading prompt tokens to always include in the compressed
