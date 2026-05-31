@@ -114,6 +114,7 @@ class TurnMetrics:
     ctx_limit: int | None = None
     ctx_remaining: int | None = None
     transcript_tokens: int | None = None
+    generated_tokens: int | None = None
     validate_max_abs: float | None = None
     validate_rms: float | None = None
     wall_s: float | None = None
@@ -688,6 +689,11 @@ def feed_repl(
                                 current.ctx_limit = int(m.group("ctx_limit"))
                                 current.ctx_remaining = int(m.group("ctx_remaining"))
                                 current.transcript_tokens = int(m.group("transcript_tokens"))
+                                if current.sync_tokens is not None:
+                                    current.generated_tokens = max(
+                                        0,
+                                        current.ctx_session_tokens - current.sync_tokens,
+                                    )
                                 current.wall_s = time.perf_counter() - t_started
                                 turns_metrics.append(current)
                                 break
@@ -714,6 +720,11 @@ def feed_repl(
                         current.ctx_limit = int(m.group(4))
                         current.ctx_remaining = int(m.group(5))
                         current.transcript_tokens = int(m.group(6))
+                        if current.sync_tokens is not None:
+                            current.generated_tokens = max(
+                                0,
+                                current.ctx_session_tokens - current.sync_tokens,
+                            )
                         current.wall_s = time.perf_counter() - t_started
                         turns_metrics.append(current)
                         break
@@ -775,6 +786,7 @@ def write_csv(metrics: list[TurnMetrics], out_path: Path) -> None:
         "canonical_tokens", "sync_tokens", "suffix_tokens",
         "effective_prompt_tps", "target_prefill_tps", "drafter_tps",
         "ctx_session_tokens", "ctx_limit", "ctx_remaining", "transcript_tokens",
+        "generated_tokens",
         "validate_max_abs", "validate_rms",
     ]
     with out_path.open("w", newline="") as fp:
@@ -789,6 +801,7 @@ def read_metrics_csv(path: Path) -> list[TurnMetrics]:
         "depth", "turn", "prompt_tokens", "compressed_tokens",
         "canonical_tokens", "sync_tokens", "suffix_tokens",
         "ctx_session_tokens", "ctx_limit", "ctx_remaining", "transcript_tokens",
+        "generated_tokens",
     }
     float_fields = {
         "prefill_tps", "gen_tps", "wall_s", "ttft_ms", "drafter_ms",
@@ -984,11 +997,13 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
         "",
         "- `ctx` = total logical chat context tokens after the turn.",
         "- `target ctx` = DS4 target KV/session tokens after the turn; for SpecPrefill this is compressed.",
+        "- `suffix` = tokens actually prefetched/synced for the turn after KV common-prefix reuse.",
+        "- `generated` = tokens emitted into the live DS4 session during the turn.",
         "- `TTFT` = chat turn start to first emitted token; DS4 breakdown includes drafter, compression, target prefill, and first decode.",
         "- `wall time` = full scripted turn time, including the complete generated response.",
         "- `decode tok/s` = emitted tokens / decode elapsed after prefill.",
         "- Chart x-axis is total logical context tokens, matching the mini-01 Qwen revalidation style.",
-        "- Baseline follow-up TTFT is warm-continuation TTFT: the prior context is resident in KV and only the new suffix is synced.",
+        "- Baseline follow-up TTFT is warm-continuation TTFT: the prior context is resident in KV and only the new suffix is synced. Use `suffix` to verify this.",
         "",
         "## Per-Turn Measurements",
         "",
@@ -999,12 +1014,16 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
         "turn",
         f"{base_label} ctx",
         f"{base_label} target ctx",
+        f"{base_label} suffix",
+        f"{base_label} generated",
         f"{base_label} TTFT ms",
         f"{base_label} wall s",
         f"{base_label} decode tok/s",
         f"{sp_label} ctx",
         f"{sp_label} target ctx",
         f"{sp_label} compressed",
+        f"{sp_label} suffix",
+        f"{sp_label} generated",
         f"{sp_label} TTFT ms",
         f"{sp_label} wall s",
         f"{sp_label} decode tok/s",
@@ -1026,12 +1045,16 @@ def write_comparison_report(metrics: list[TurnMetrics], out_dir: Path, title: st
             str(turn + 1),
             fmt(base.transcript_tokens if base else None, 0),
             fmt(base.ctx_session_tokens if base else None, 0),
+            fmt(base.suffix_tokens if base else None, 0),
+            fmt(base.generated_tokens if base else None, 0),
             fmt(base.ttft_ms if base else None),
             fmt(base.wall_s if base else None),
             fmt(base.gen_tps if base else None),
             fmt(sp.transcript_tokens if sp else None, 0),
             fmt(sp.ctx_session_tokens if sp else None, 0),
             fmt(sp.compressed_tokens if sp else None, 0),
+            fmt(sp.suffix_tokens if sp else None, 0),
+            fmt(sp.generated_tokens if sp else None, 0),
             fmt(sp.ttft_ms if sp else None),
             fmt(sp.wall_s if sp else None),
             fmt(sp.gen_tps if sp else None),
