@@ -10290,8 +10290,14 @@ static void generate_job(server *s, job *j) {
     ds4_tokens spec_prompt = {0};
     double spec_drafter_ms = 0.0;
     double spec_compress_ms = 0.0;
+    if (s->spec_prefill_enabled && cached == 0 && j->req.has_tools) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: spec-prefill skipped for tool request prompt=%d",
+                   prompt_for_sync->len);
+    }
     if (s->spec_prefill_enabled &&
         cached == 0 &&
+        !j->req.has_tools &&
         prompt_for_sync->len > s->spec_prefill_tail)
     {
         ds4_spec_prefill_options spo = ds4_spec_prefill_options_default();
