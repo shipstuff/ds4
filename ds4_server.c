@@ -7700,6 +7700,12 @@ typedef struct {
     FILE *out_fp;
 } server_live_drafter;
 
+typedef struct {
+    ds4_token_range *v;
+    int len;
+    int cap;
+} server_token_ranges;
+
 static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
 
@@ -8686,6 +8692,107 @@ static char *render_tokens_text_with_spans(ds4_engine *engine,
     if (out_len) *out_len = len;
     if (spans_out) *spans_out = spans;
     return buf;
+}
+
+static void token_ranges_free(server_token_ranges *ranges) {
+    if (!ranges) return;
+    free(ranges->v);
+    memset(ranges, 0, sizeof(*ranges));
+}
+
+static void token_ranges_push(server_token_ranges *ranges, int start, int end) {
+    if (!ranges || end <= start) return;
+    if (ranges->len == ranges->cap) {
+        int next = ranges->cap ? ranges->cap * 2 : 8;
+        ds4_token_range *v = xrealloc(ranges->v, (size_t)next * sizeof(v[0]));
+        ranges->v = v;
+        ranges->cap = next;
+    }
+    ranges->v[ranges->len++] = (ds4_token_range){ .start = start, .end = end };
+}
+
+static int token_ranges_total_tokens(const server_token_ranges *ranges) {
+    int n = 0;
+    if (!ranges) return 0;
+    for (int i = 0; i < ranges->len; i++) {
+        if (ranges->v[i].end > ranges->v[i].start) {
+            n += ranges->v[i].end - ranges->v[i].start;
+        }
+    }
+    return n;
+}
+
+static void protect_byte_range(server_token_ranges *ranges,
+                               const uint32_t *spans,
+                               int n_tokens,
+                               size_t byte_start,
+                               size_t byte_end) {
+    if (!ranges || !spans || byte_end <= byte_start) return;
+    int tok_start = -1;
+    int tok_end = -1;
+    for (int i = 0; i < n_tokens; i++) {
+        const size_t s0 = spans[(size_t)i * 2u + 0u];
+        const size_t s1 = spans[(size_t)i * 2u + 1u];
+        if (s1 > byte_start && s0 < byte_end) {
+            if (tok_start < 0) tok_start = i;
+            tok_end = i + 1;
+        }
+    }
+    if (tok_start >= 0 && tok_end > tok_start) {
+        token_ranges_push(ranges, tok_start, tok_end);
+    }
+}
+
+static void protect_all_between(server_token_ranges *ranges,
+                                const char *text,
+                                const uint32_t *spans,
+                                int n_tokens,
+                                const char *start_marker,
+                                const char *end_marker) {
+    if (!ranges || !text || !start_marker || !end_marker) return;
+    const char *p = text;
+    const size_t end_len = strlen(end_marker);
+    while ((p = strstr(p, start_marker)) != NULL) {
+        const char *end = strstr(p, end_marker);
+        if (end) end += end_len;
+        else end = text + strlen(text);
+        protect_byte_range(ranges, spans, n_tokens,
+                           (size_t)(p - text), (size_t)(end - text));
+        p = end;
+    }
+}
+
+static void build_tool_protected_ranges(server *s,
+                                        const ds4_tokens *prompt,
+                                        server_token_ranges *ranges) {
+    if (!s || !prompt || !ranges) return;
+    size_t text_len = 0;
+    uint32_t *spans = NULL;
+    char *text = render_tokens_text_with_spans(s->engine, prompt, &text_len, &spans);
+    if (!text || !spans) {
+        free(text);
+        free(spans);
+        return;
+    }
+
+    const char *tool_schema = strstr(text, "You have access to a set of tools");
+    if (tool_schema) {
+        const char *end = strstr(tool_schema, "<｜User｜>");
+        if (!end) end = strstr(tool_schema, "<|User|>");
+        if (!end) end = text + text_len;
+        protect_byte_range(ranges, spans, prompt->len,
+                           (size_t)(tool_schema - text), (size_t)(end - text));
+    }
+
+    protect_all_between(ranges, text, spans, prompt->len,
+                        "<tool_result>", "</tool_result>");
+    protect_all_between(ranges, text, spans, prompt->len,
+                        DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_END);
+    protect_all_between(ranges, text, spans, prompt->len,
+                        DS4_TOOL_CALLS_START_SHORT, DS4_TOOL_CALLS_END_SHORT);
+
+    free(text);
+    free(spans);
 }
 
 static void server_live_drafter_stop(server *s) {
@@ -10290,14 +10397,9 @@ static void generate_job(server *s, job *j) {
     ds4_tokens spec_prompt = {0};
     double spec_drafter_ms = 0.0;
     double spec_compress_ms = 0.0;
-    if (s->spec_prefill_enabled && cached == 0 && j->req.has_tools) {
-        server_log(DS4_LOG_PREFILL,
-                   "ds4-server: spec-prefill skipped for tool request prompt=%d",
-                   prompt_for_sync->len);
-    }
+    server_token_ranges protected_ranges = {0};
     if (s->spec_prefill_enabled &&
         cached == 0 &&
-        !j->req.has_tools &&
         prompt_for_sync->len > s->spec_prefill_tail)
     {
         ds4_spec_prefill_options spo = ds4_spec_prefill_options_default();
@@ -10305,6 +10407,11 @@ static void generate_job(server *s, job *j) {
         spo.sink_size = s->spec_prefill_sink;
         spo.tail_size = s->spec_prefill_tail;
         spo.chunk_size = s->spec_prefill_chunk;
+        if (j->req.has_tools) {
+            build_tool_protected_ranges(s, prompt_for_sync, &protected_ranges);
+            spo.protected_ranges = protected_ranges.v;
+            spo.protected_ranges_len = protected_ranges.len;
+        }
 
         float *scores_buf = NULL;
         int scores_len = 0;
@@ -10314,6 +10421,7 @@ static void generate_job(server *s, job *j) {
                                       &spec_drafter_ms,
                                       sferr, sizeof(sferr)) != 0) {
             ds4_tokens_free(&effective_prompt);
+            token_ranges_free(&protected_ranges);
             http_error(j->fd, s->enable_cors, 500, sferr);
             return;
         }
@@ -10328,15 +10436,18 @@ static void generate_job(server *s, job *j) {
             free(scores_buf);
             ds4_tokens_free(&effective_prompt);
             ds4_tokens_free(&spec_prompt);
+            token_ranges_free(&protected_ranges);
             http_error(j->fd, s->enable_cors, 500, cerr);
             return;
         }
         spec_compress_ms = (now_sec() - t_compress0) * 1000.0;
         free(scores_buf);
+        const int protected_tokens = token_ranges_total_tokens(&protected_ranges);
+        token_ranges_free(&protected_ranges);
         if (spec_prompt.len < prompt_for_sync->len) {
             server_log(DS4_LOG_PREFILL,
                        "ds4-server: spec-prefill fresh prompt %d -> %d tokens "
-                       "(keep=%.2f sink=%d tail=%d chunk=%d scores=%s drafter=%.2fms compress=%.2fms)",
+                       "(keep=%.2f sink=%d tail=%d chunk=%d scores=%s protected_ranges=%d protected_tokens=%d drafter=%.2fms compress=%.2fms)",
                        prompt_for_sync->len,
                        spec_prompt.len,
                        spo.keep_pct,
@@ -10344,6 +10455,8 @@ static void generate_job(server *s, job *j) {
                        spo.tail_size,
                        spo.chunk_size,
                        "drafter-live-local",
+                       spo.protected_ranges_len,
+                       protected_tokens,
                        spec_drafter_ms,
                        spec_compress_ms);
             ds4_session_invalidate(s->session);
@@ -14898,6 +15011,40 @@ static void test_thinking_checkpoint_remember_gate(void) {
     request_free(&r);
 }
 
+static void test_spec_prefill_tool_protected_span_markers(void) {
+    const char *text =
+        "intro "
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"read\">payload" DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END
+        " middle <tool_result>file contents</tool_result> outro";
+    const int n_tokens = (int)strlen(text);
+    uint32_t *spans = xmalloc((size_t)n_tokens * 2u * sizeof(spans[0]));
+    for (int i = 0; i < n_tokens; i++) {
+        spans[(size_t)i * 2u + 0u] = (uint32_t)i;
+        spans[(size_t)i * 2u + 1u] = (uint32_t)(i + 1);
+    }
+
+    server_token_ranges ranges = {0};
+    protect_all_between(&ranges, text, spans, n_tokens,
+                        DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_END);
+    protect_all_between(&ranges, text, spans, n_tokens,
+                        "<tool_result>", "</tool_result>");
+
+    const char *call_start = strstr(text, DS4_TOOL_CALLS_START);
+    const char *call_end = strstr(text, DS4_TOOL_CALLS_END) + strlen(DS4_TOOL_CALLS_END);
+    const char *result_start = strstr(text, "<tool_result>");
+    const char *result_end = strstr(text, "</tool_result>") + strlen("</tool_result>");
+    TEST_ASSERT(ranges.len == 2);
+    TEST_ASSERT(ranges.v[0].start == (int)(call_start - text));
+    TEST_ASSERT(ranges.v[0].end == (int)(call_end - text));
+    TEST_ASSERT(ranges.v[1].start == (int)(result_start - text));
+    TEST_ASSERT(ranges.v[1].end == (int)(result_end - text));
+
+    token_ranges_free(&ranges);
+    free(spans);
+}
+
 static void test_tool_marker_state_ignores_orphan_end(void) {
     bool saw_start = false;
     bool saw_end = false;
@@ -16042,6 +16189,7 @@ static void ds4_server_unit_tests_run(void) {
     test_client_socket_nonblocking_flag();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_remember_gate();
+    test_spec_prefill_tool_protected_span_markers();
     test_tool_marker_state_ignores_orphan_end();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();
     test_kv_cache_store_len_uses_configured_boundary();

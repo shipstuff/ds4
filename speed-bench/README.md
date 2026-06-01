@@ -139,7 +139,8 @@ export PYTHONPATH="$PWD/../mlx-lm:${PYTHONPATH:-}"
   --spec-prefill-drafter-tokenizer ./gguf/dsv4-tokenizer
 ```
 
-Server SpecPrefill currently supports fresh compression for non-tool requests.
-Existing live and disk KV cache hits still run through the normal server cache
-path. Tool-enabled requests intentionally skip SpecPrefill so tool schemas,
-tool-call IDs, tool results, and file contents stay exact.
+Server SpecPrefill currently supports fresh compression. Existing live and disk
+KV cache hits still run through the normal server cache path. Tool-enabled
+requests use protected spans so tool schemas, tool-call IDs, tool results, and
+file contents stay exact while surrounding natural-language history can still be
+compressed.

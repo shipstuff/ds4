@@ -1905,6 +1905,31 @@ static void test_spec_prefill_unit(void) {
         ds4_tokens_free(&out);
     }
 
+    /* Case 6e: protected ranges are kept even when keep_pct=0. */
+    {
+        const int SINK = 4;
+        const int TAIL = 8;
+        ds4_token_range protected_ranges[] = {
+            { .start = 400, .end = 410 },
+        };
+        ds4_spec_prefill_options o = ds4_spec_prefill_options_default();
+        o.keep_pct = 0.0f;
+        o.sink_size = SINK;
+        o.tail_size = TAIL;
+        o.protected_ranges = protected_ranges;
+        o.protected_ranges_len = 1;
+        ds4_tokens out = {0};
+        char err[256];
+        TEST_ASSERT(ds4_spec_prefill_compress(NULL, &prompt, &o, &out, err, sizeof(err)) == 0);
+        TEST_ASSERT(out.len == SINK + 10 + TAIL);
+        for (int i = 0; i < SINK; i++) TEST_ASSERT(out.v[i] == prompt.v[i]);
+        for (int i = 0; i < 10; i++) TEST_ASSERT(out.v[SINK + i] == prompt.v[400 + i]);
+        for (int i = 0; i < TAIL; i++) {
+            TEST_ASSERT(out.v[SINK + 10 + i] == prompt.v[N - TAIL + i]);
+        }
+        ds4_tokens_free(&out);
+    }
+
     /* Case 7: scores file loader round-trip. */
     {
         char path[] = "/tmp/ds4_specprefill_scores_XXXXXX.txt";

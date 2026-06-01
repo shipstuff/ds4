@@ -15793,6 +15793,14 @@ static int ds4_chunk_score_cmp_index_asc(const void *a, const void *b) {
     return 0;
 }
 
+static void ds4_spec_prefill_mark_range(bool *keep, int prompt_len, int start, int end) {
+    if (!keep || prompt_len <= 0) return;
+    if (start < 0) start = 0;
+    if (end > prompt_len) end = prompt_len;
+    if (end <= start) return;
+    for (int t = start; t < end; t++) keep[t] = true;
+}
+
 int ds4_spec_prefill_load_scores_file(
         const char *path,
         int expected_len,
@@ -15934,12 +15942,23 @@ int ds4_spec_prefill_compress(
     const int scorable_end   = prompt->len - tail_size;
     const int scorable_len   = scorable_end - scorable_start;
 
-    /* keep_pct=0: degenerate case -- skip middle entirely, emit just
-     * sink + tail.  Matches the anemll reference fallback. */
+    bool *keep = xcalloc((size_t)prompt->len, sizeof(keep[0]));
+    ds4_spec_prefill_mark_range(keep, prompt->len, 0, sink_size);
+    ds4_spec_prefill_mark_range(keep, prompt->len, scorable_end, prompt->len);
+    for (int i = 0; i < opt.protected_ranges_len; i++) {
+        ds4_spec_prefill_mark_range(keep, prompt->len,
+                                    opt.protected_ranges[i].start,
+                                    opt.protected_ranges[i].end);
+    }
+
+    /* keep_pct=0: skip score-selected middle chunks, but still keep sink, tail,
+     * and any caller-protected ranges. */
     if (opt.keep_pct == 0.0f || scorable_len == 0) {
         out->len = 0;
-        for (int t = 0; t < sink_size; t++) token_vec_push(out, prompt->v[t]);
-        for (int t = scorable_end; t < prompt->len; t++) token_vec_push(out, prompt->v[t]);
+        for (int t = 0; t < prompt->len; t++) {
+            if (keep[t]) token_vec_push(out, prompt->v[t]);
+        }
+        free(keep);
         free(self_scored);
         return 0;
     }
@@ -15980,20 +15999,22 @@ int ds4_spec_prefill_compress(
     qsort(chunks, (size_t)n_chunks, sizeof(ds4_chunk_score), ds4_chunk_score_cmp_desc);
     qsort(chunks, (size_t)keep_n,   sizeof(ds4_chunk_score), ds4_chunk_score_cmp_index_asc);
 
-    /* Emit the compressed prompt: sink + selected middle chunks + tail.
-     * Sink and tail are additive to the chunk-selected set, per the
-     * anemll reference (never replaces a selected chunk). */
-    out->len = 0;
-    for (int t = 0; t < sink_size; t++) token_vec_push(out, prompt->v[t]);
+    /* Mark selected middle chunks.  Sink, tail, and caller-protected ranges are
+     * additive, and the final emission pass keeps original token order. */
     for (int k = 0; k < keep_n; k++) {
         const int ci    = chunks[k].index;
         const int start = scorable_start + ci * chunk_size;
         const int end_  = start + chunk_size < scorable_end ? start + chunk_size : scorable_end;
-        for (int t = start; t < end_; t++) token_vec_push(out, prompt->v[t]);
+        ds4_spec_prefill_mark_range(keep, prompt->len, start, end_);
     }
     free(chunks);
-    for (int t = scorable_end; t < prompt->len; t++) token_vec_push(out, prompt->v[t]);
 
+    out->len = 0;
+    for (int t = 0; t < prompt->len; t++) {
+        if (keep[t]) token_vec_push(out, prompt->v[t]);
+    }
+
+    free(keep);
     free(self_scored);
     return 0;
 }

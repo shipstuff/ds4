@@ -39,6 +39,11 @@ typedef enum {
 } ds4_log_type;
 
 typedef struct {
+    int start;
+    int end;
+} ds4_token_range;
+
+typedef struct {
     int *v;
     int len;
     int cap;
@@ -311,6 +316,12 @@ typedef struct {
 
     /* Tokens per chunk for chunk-wise selection.  Default 32. */
     int chunk_size;
+
+    /* Optional token ranges that must be preserved exactly.  Ranges use
+     * half-open token offsets [start, end) in the original prompt.  They are
+     * additive with sink/tail and selected chunks. */
+    const ds4_token_range *protected_ranges;
+    int protected_ranges_len;
 
     /* Optional per-prompt-token importance scores.  When non-NULL, must have
      * exactly `prompt->len` entries.  Higher = more important. */
