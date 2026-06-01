@@ -116,3 +116,29 @@ The SpecPrefill mode uses the live local drafter by default:
 Override it with `DRAFTER_MODEL=/path/to/mlx-drafter`. The DS4 target model,
 DSV4 tokenizer, drafter Python, and MLX checkout can be overridden with `MODEL`,
 `DRAFTER_TOKENIZER`, `DRAFTER_PYTHON`, and `MLX_LM_DIR`.
+
+### Server Mode
+
+`ds4-server` accepts the same live-drafter SpecPrefill options for cold HTTP
+request prefills:
+
+```
+export PYTHONPATH="$PWD/../mlx-lm:${PYTHONPATH:-}"
+
+./ds4-server -m ./ds4flash.gguf \
+  --ctx 65536 \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --spec-prefill=0.3 \
+  --spec-prefill-tail 256 \
+  --spec-prefill-chunk 32 \
+  --spec-prefill-cache fresh \
+  --spec-prefill-drafter-model ./gguf/qwen3.5-0.8b-mlx-4bit \
+  --spec-prefill-drafter-python python3 \
+  --spec-prefill-drafter-script speed-bench/ds4_live_drafter.py \
+  --spec-prefill-drafter-tokenizer ./gguf/dsv4-tokenizer
+```
+
+Server SpecPrefill currently supports fresh compression. Existing live and disk
+KV cache hits still run through the normal server cache path; cache misses can
+use the live drafter to compress the full request prompt before prefill.

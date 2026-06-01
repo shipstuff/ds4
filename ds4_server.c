@@ -35,6 +35,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -7693,6 +7694,12 @@ typedef struct {
     size_t visible_len;
 } visible_live_state;
 
+typedef struct {
+    pid_t pid;
+    int in_fd;
+    FILE *out_fp;
+} server_live_drafter;
+
 static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
 
@@ -7719,6 +7726,18 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+    bool spec_prefill_enabled;
+    float spec_prefill_keep_pct;
+    int spec_prefill_sink;
+    int spec_prefill_tail;
+    int spec_prefill_chunk;
+    const char *spec_prefill_drafter_model;
+    const char *spec_prefill_drafter_python;
+    const char *spec_prefill_drafter_script;
+    const char *spec_prefill_drafter_tokenizer;
+    int spec_prefill_score_lookahead;
+    int spec_prefill_score_pool_kernel;
+    server_live_drafter drafter;
 };
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
@@ -8602,6 +8621,238 @@ static void kv_cache_close(kv_disk_cache *kc) {
 
 static char *render_tokens_text(ds4_engine *engine, const ds4_tokens *tokens, size_t *out_len) {
     return ds4_kvstore_render_tokens_text(engine, tokens, out_len);
+}
+
+static int write_all_fd(int fd, const void *buf, size_t len) {
+    const unsigned char *p = buf;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static char *render_tokens_text_with_spans(ds4_engine *engine,
+                                           const ds4_tokens *tokens,
+                                           size_t *out_len,
+                                           uint32_t **spans_out) {
+    size_t len = 0;
+    size_t cap = 4096;
+    char *buf = malloc(cap);
+    if (!buf) return NULL;
+    uint32_t *spans = NULL;
+    if (spans_out) {
+        spans = malloc((size_t)tokens->len * 2u * sizeof(spans[0]));
+        if (!spans) {
+            free(buf);
+            return NULL;
+        }
+    }
+    for (int i = 0; i < tokens->len; i++) {
+        size_t piece_len = 0;
+        char *piece = ds4_token_text(engine, tokens->v[i], &piece_len);
+        if (!piece && piece_len > 0) {
+            free(spans);
+            free(buf);
+            return NULL;
+        }
+        const size_t start = len;
+        if (len + piece_len + 1 > cap) {
+            while (len + piece_len + 1 > cap) cap *= 2;
+            char *next = realloc(buf, cap);
+            if (!next) {
+                free(piece);
+                free(spans);
+                free(buf);
+                return NULL;
+            }
+            buf = next;
+        }
+        if (piece_len > 0) memcpy(buf + len, piece, piece_len);
+        len += piece_len;
+        if (spans) {
+            spans[(size_t)i * 2u + 0u] = start > UINT32_MAX ? UINT32_MAX : (uint32_t)start;
+            spans[(size_t)i * 2u + 1u] = len > UINT32_MAX ? UINT32_MAX : (uint32_t)len;
+        }
+        free(piece);
+    }
+    buf[len] = '\0';
+    if (out_len) *out_len = len;
+    if (spans_out) *spans_out = spans;
+    return buf;
+}
+
+static void server_live_drafter_stop(server *s) {
+    if (!s) return;
+    if (s->drafter.in_fd > 0) {
+        (void)write_all_fd(s->drafter.in_fd, "QUIT\n", 5);
+        close(s->drafter.in_fd);
+        s->drafter.in_fd = -1;
+    }
+    if (s->drafter.out_fp) {
+        fclose(s->drafter.out_fp);
+        s->drafter.out_fp = NULL;
+    }
+    if (s->drafter.pid > 0) {
+        waitpid(s->drafter.pid, NULL, 0);
+        s->drafter.pid = 0;
+    }
+}
+
+static int server_live_drafter_start(server *s, char *err, size_t errlen) {
+    if (s->drafter.pid > 0) return 0;
+    const char *python = s->spec_prefill_drafter_python ?
+        s->spec_prefill_drafter_python : "python3";
+    const char *script = s->spec_prefill_drafter_script ?
+        s->spec_prefill_drafter_script : "speed-bench/ds4_live_drafter.py";
+    const char *tokenizer = s->spec_prefill_drafter_tokenizer ?
+        s->spec_prefill_drafter_tokenizer : "./gguf/dsv4-tokenizer";
+    char lookahead_arg[32];
+    char pool_arg[32];
+    snprintf(lookahead_arg, sizeof(lookahead_arg), "%d", s->spec_prefill_score_lookahead);
+    snprintf(pool_arg, sizeof(pool_arg), "%d", s->spec_prefill_score_pool_kernel);
+
+    int to_child[2];
+    int from_child[2];
+    if (pipe(to_child) != 0 || pipe(from_child) != 0) {
+        snprintf(err, errlen, "live drafter pipe failed: %s", strerror(errno));
+        return -1;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        snprintf(err, errlen, "live drafter fork failed: %s", strerror(errno));
+        close(to_child[0]); close(to_child[1]);
+        close(from_child[0]); close(from_child[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        dup2(to_child[0], STDIN_FILENO);
+        dup2(from_child[1], STDOUT_FILENO);
+        close(to_child[0]); close(to_child[1]);
+        close(from_child[0]); close(from_child[1]);
+        execlp(python, python, "-u", script,
+               "--scorer-model", s->spec_prefill_drafter_model,
+               "--dsv4-tokenizer", tokenizer,
+               "--n-lookahead", lookahead_arg,
+               "--pool-kernel", pool_arg,
+               (char *)NULL);
+        fprintf(stderr, "ds4-server: exec live drafter failed: %s\n", strerror(errno));
+        _exit(127);
+    }
+
+    close(to_child[0]);
+    close(from_child[1]);
+    FILE *out = fdopen(from_child[0], "rb");
+    if (!out) {
+        snprintf(err, errlen, "live drafter fdopen failed: %s", strerror(errno));
+        close(to_child[1]);
+        close(from_child[0]);
+        kill(pid, SIGTERM);
+        waitpid(pid, NULL, 0);
+        return -1;
+    }
+    s->drafter.pid = pid;
+    s->drafter.in_fd = to_child[1];
+    s->drafter.out_fp = out;
+    server_log(DS4_LOG_PREFILL,
+               "ds4-server: spec-prefill live drafter started pid=%ld model=%s",
+               (long)pid, s->spec_prefill_drafter_model);
+
+    char ready[128];
+    if (!fgets(ready, sizeof(ready), s->drafter.out_fp)) {
+        snprintf(err, errlen, "live drafter closed before ready");
+        server_live_drafter_stop(s);
+        return -1;
+    }
+    if (strcmp(ready, "READY\n") != 0) {
+        snprintf(err, errlen, "live drafter startup error: %.96s", ready);
+        server_live_drafter_stop(s);
+        return -1;
+    }
+    server_log(DS4_LOG_PREFILL,
+               "ds4-server: spec-prefill live drafter ready pid=%ld",
+               (long)pid);
+    return 0;
+}
+
+static int server_live_drafter_score(server *s,
+                                     const ds4_tokens *prompt,
+                                     float **scores_out,
+                                     int *scores_len_out,
+                                     double *score_ms_out,
+                                     char *err,
+                                     size_t errlen) {
+    *scores_out = NULL;
+    *scores_len_out = 0;
+    if (score_ms_out) *score_ms_out = 0.0;
+    if (server_live_drafter_start(s, err, errlen) != 0) return -1;
+
+    size_t text_len = 0;
+    uint32_t *spans = NULL;
+    char *text = render_tokens_text_with_spans(s->engine, prompt, &text_len, &spans);
+    if (!text) {
+        snprintf(err, errlen, "live drafter failed to render transcript");
+        return -1;
+    }
+
+    char header[128];
+    int header_len = snprintf(header, sizeof(header), "SCORE2 %d %zu\n",
+                              prompt->len, text_len);
+    if (header_len <= 0 || (size_t)header_len >= sizeof(header) ||
+        write_all_fd(s->drafter.in_fd, header, (size_t)header_len) != 0 ||
+        write_all_fd(s->drafter.in_fd, text, text_len) != 0 ||
+        write_all_fd(s->drafter.in_fd, spans,
+                     (size_t)prompt->len * 2u * sizeof(spans[0])) != 0) {
+        free(text);
+        free(spans);
+        snprintf(err, errlen, "live drafter request write failed: %s", strerror(errno));
+        return -1;
+    }
+    free(text);
+    free(spans);
+
+    char line[256];
+    if (!fgets(line, sizeof(line), s->drafter.out_fp)) {
+        snprintf(err, errlen, "live drafter closed before response");
+        return -1;
+    }
+    int n = 0;
+    double total_ms = 0.0, tokenize_ms = 0.0, score_ms = 0.0, align_ms = 0.0;
+    if (sscanf(line, "OK %d %lf %lf %lf %lf", &n, &total_ms, &tokenize_ms,
+               &score_ms, &align_ms) != 5) {
+        snprintf(err, errlen, "live drafter error: %.220s", line);
+        return -1;
+    }
+    if (n != prompt->len) {
+        snprintf(err, errlen, "live drafter returned %d scores for %d tokens",
+                 n, prompt->len);
+        return -1;
+    }
+    float *scores = malloc((size_t)n * sizeof(scores[0]));
+    if (!scores) {
+        snprintf(err, errlen, "out of memory reading live drafter scores");
+        return -1;
+    }
+    size_t got = fread(scores, sizeof(scores[0]), (size_t)n, s->drafter.out_fp);
+    if (got != (size_t)n) {
+        free(scores);
+        snprintf(err, errlen, "live drafter score payload truncated (%zu/%d)", got, n);
+        return -1;
+    }
+    *scores_out = scores;
+    *scores_len_out = n;
+    if (score_ms_out) *score_ms_out = total_ms;
+    server_log(DS4_LOG_PREFILL,
+               "ds4-server: spec-prefill live drafter scored %d tokens in %.2f ms "
+               "(tokenize=%.2f score=%.2f align=%.2f)",
+               n, total_ms, tokenize_ms, score_ms, align_ms);
+    return 0;
 }
 
 static bool byte_prefix_match(const char *text, size_t text_len,
@@ -10036,6 +10287,68 @@ static void generate_job(server *s, job *j) {
         responses_protocol &&
         j->req.responses_requires_live_reasoning &&
         !responses_reasoning_state_preserved;
+    ds4_tokens spec_prompt = {0};
+    double spec_drafter_ms = 0.0;
+    double spec_compress_ms = 0.0;
+    if (s->spec_prefill_enabled &&
+        cached == 0 &&
+        prompt_for_sync->len > s->spec_prefill_tail)
+    {
+        ds4_spec_prefill_options spo = ds4_spec_prefill_options_default();
+        spo.keep_pct = s->spec_prefill_keep_pct;
+        spo.sink_size = s->spec_prefill_sink;
+        spo.tail_size = s->spec_prefill_tail;
+        spo.chunk_size = s->spec_prefill_chunk;
+
+        float *scores_buf = NULL;
+        int scores_len = 0;
+        char sferr[256];
+        if (server_live_drafter_score(s, prompt_for_sync,
+                                      &scores_buf, &scores_len,
+                                      &spec_drafter_ms,
+                                      sferr, sizeof(sferr)) != 0) {
+            ds4_tokens_free(&effective_prompt);
+            http_error(j->fd, s->enable_cors, 500, sferr);
+            return;
+        }
+        spo.scores = scores_buf;
+        spo.scores_len = scores_len;
+        spo.self_score = false;
+
+        char cerr[256];
+        const double t_compress0 = now_sec();
+        if (ds4_spec_prefill_compress(s->engine, prompt_for_sync, &spo,
+                                      &spec_prompt, cerr, sizeof(cerr)) != 0) {
+            free(scores_buf);
+            ds4_tokens_free(&effective_prompt);
+            ds4_tokens_free(&spec_prompt);
+            http_error(j->fd, s->enable_cors, 500, cerr);
+            return;
+        }
+        spec_compress_ms = (now_sec() - t_compress0) * 1000.0;
+        free(scores_buf);
+        if (spec_prompt.len < prompt_for_sync->len) {
+            server_log(DS4_LOG_PREFILL,
+                       "ds4-server: spec-prefill fresh prompt %d -> %d tokens "
+                       "(keep=%.2f sink=%d tail=%d chunk=%d scores=%s drafter=%.2fms compress=%.2fms)",
+                       prompt_for_sync->len,
+                       spec_prompt.len,
+                       spo.keep_pct,
+                       spo.sink_size,
+                       spo.tail_size,
+                       spo.chunk_size,
+                       "drafter-live-local",
+                       spec_drafter_ms,
+                       spec_compress_ms);
+            ds4_session_invalidate(s->session);
+            prompt_for_sync = &spec_prompt;
+            cached = 0;
+            cache_source = "specprefill-drafter";
+            disk_cached = 0;
+        } else {
+            ds4_tokens_free(&spec_prompt);
+        }
+    }
     const int prompt_tokens = prompt_for_sync->len;
     /* OpenAI usage details: the reusable prefix is a cache read, while the
      * effective prompt suffix evaluated by ds4_session_sync() is written into
@@ -10143,6 +10456,7 @@ static void generate_job(server *s, job *j) {
         if (ds4_session_sync(s->session, &prefix, err, sizeof(err)) != 0) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
+            ds4_tokens_free(&spec_prompt);
             ds4_session_set_progress(s->session, NULL, NULL);
             ds4_session_set_display_progress(s->session, NULL, NULL);
             kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
@@ -10166,6 +10480,7 @@ static void generate_job(server *s, job *j) {
 
     if (ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err)) != 0) {
         ds4_tokens_free(&effective_prompt);
+        ds4_tokens_free(&spec_prompt);
         ds4_session_set_progress(s->session, NULL, NULL);
         ds4_session_set_display_progress(s->session, NULL, NULL);
         kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
@@ -10222,6 +10537,7 @@ static void generate_job(server *s, job *j) {
                        req_flags[0] ? " " : "",
                        req_flags);
             ds4_tokens_free(&effective_prompt);
+            ds4_tokens_free(&spec_prompt);
             return;
         }
         /* The prefill progress callback may have already sent the SSE headers
@@ -10235,6 +10551,7 @@ static void generate_job(server *s, job *j) {
                        req_flags[0] ? " " : "",
                        req_flags);
             ds4_tokens_free(&effective_prompt);
+            ds4_tokens_free(&spec_prompt);
             return;
         }
         progress.headers_sent = true;
@@ -10243,12 +10560,14 @@ static void generate_job(server *s, job *j) {
                                       prompt_tokens, &anthropic_live)) {
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
             ds4_tokens_free(&effective_prompt);
+            ds4_tokens_free(&spec_prompt);
             return;
         }
         if (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT &&
             !sse_chunk(j->fd, &j->req, id, NULL, NULL)) {
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s openai role chunk failed", ctx_span);
             ds4_tokens_free(&effective_prompt);
+            ds4_tokens_free(&spec_prompt);
             return;
         }
         if (openai_live_chat) openai_stream_start(&j->req, &openai_live);
@@ -10263,6 +10582,7 @@ static void generate_job(server *s, job *j) {
                            req_flags);
                 responses_stream_free(&responses_live);
                 ds4_tokens_free(&effective_prompt);
+                ds4_tokens_free(&spec_prompt);
                 return;
             }
         }
@@ -10918,6 +11238,7 @@ decode_again:
     responses_stream_free(&responses_live);
     buf_free(&text);
     ds4_tokens_free(&effective_prompt);
+    ds4_tokens_free(&spec_prompt);
 }
 
 static bool enqueue(server *s, job *j) {
@@ -11286,6 +11607,17 @@ typedef struct {
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
+    bool spec_prefill_enabled;
+    float spec_prefill_keep_pct;
+    int spec_prefill_sink;
+    int spec_prefill_tail;
+    int spec_prefill_chunk;
+    const char *spec_prefill_drafter_model;
+    const char *spec_prefill_drafter_python;
+    const char *spec_prefill_drafter_script;
+    const char *spec_prefill_drafter_tokenizer;
+    int spec_prefill_score_lookahead;
+    int spec_prefill_score_pool_kernel;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -11339,6 +11671,7 @@ static void log_context_memory(ds4_backend backend, int ctx_size) {
 }
 
 static void server_close_resources(server *s) {
+    server_live_drafter_stop(s);
     if (s->trace) {
         fclose(s->trace);
         s->trace = NULL;
@@ -11393,6 +11726,27 @@ static void usage(FILE *fp) {
         "      Target GPU duty cycle percentage, 1..100. Default: 100\n"
         "  --metal | --cuda | --cpu | --backend NAME\n"
         "      Select backend explicitly. Defaults to Metal on macOS and CUDA on CUDA builds.\n"
+        "\n"
+        "SpecPrefill:\n"
+        "  --spec-prefill[=KEEP_PCT]\n"
+        "      Compress cold prompt prefills with the live drafter before ds4_session_sync.\n"
+        "      Requires --spec-prefill-drafter-model. Default keep with flag: 0.2\n"
+        "  --spec-prefill-sink N\n"
+        "      Leading prompt tokens always kept. Default: 16\n"
+        "  --spec-prefill-tail N\n"
+        "      Trailing prompt tokens always kept. Default: 256\n"
+        "  --spec-prefill-chunk N\n"
+        "      Chunk size for prompt selection. Default: 32\n"
+        "  --spec-prefill-cache fresh\n"
+        "      Server SpecPrefill currently supports fresh compression only.\n"
+        "  --spec-prefill-drafter-model PATH\n"
+        "      Enable the live local MLX drafter lane for prompt scores.\n"
+        "  --spec-prefill-drafter-python PATH\n"
+        "      Python executable for the resident drafter helper. Default: python3\n"
+        "  --spec-prefill-drafter-script PATH\n"
+        "      Helper script. Default: speed-bench/ds4_live_drafter.py\n"
+        "  --spec-prefill-drafter-tokenizer PATH\n"
+        "      DS4 tokenizer directory for drafter-side token alignment. Default: ./gguf/dsv4-tokenizer\n"
         "\n"
         "HTTP API:\n"
         "  --host HOST\n"
@@ -11486,6 +11840,16 @@ static server_config parse_options(int argc, char **argv) {
         .ctx_size = 32768,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
+        .spec_prefill_enabled = false,
+        .spec_prefill_keep_pct = 0.2f,
+        .spec_prefill_sink = 16,
+        .spec_prefill_tail = 256,
+        .spec_prefill_chunk = 32,
+        .spec_prefill_drafter_python = "python3",
+        .spec_prefill_drafter_script = "speed-bench/ds4_live_drafter.py",
+        .spec_prefill_drafter_tokenizer = "./gguf/dsv4-tokenizer",
+        .spec_prefill_score_lookahead = 4,
+        .spec_prefill_score_pool_kernel = 13,
     };
     c.kv_cache = kv_cache_default_options();
 
@@ -11583,6 +11947,39 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = DS4_BACKEND_CPU;
+        } else if (!strcmp(arg, "--spec-prefill") ||
+                   !strncmp(arg, "--spec-prefill=", strlen("--spec-prefill="))) {
+            c.spec_prefill_enabled = true;
+            if (arg[strlen("--spec-prefill")] == '=') {
+                c.spec_prefill_keep_pct =
+                    parse_float_arg(arg + strlen("--spec-prefill="), arg, 0.0001f, 1.0f);
+            }
+        } else if (!strcmp(arg, "--spec-prefill-sink")) {
+            c.spec_prefill_sink = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--spec-prefill-tail")) {
+            c.spec_prefill_tail = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--spec-prefill-chunk")) {
+            c.spec_prefill_chunk = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--spec-prefill-cache")) {
+            const char *mode = need_arg(&i, argc, argv, arg);
+            if (strcmp(mode, "fresh") != 0) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --spec-prefill-cache currently supports only fresh");
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--spec-prefill-drafter-model")) {
+            c.spec_prefill_drafter_model = need_arg(&i, argc, argv, arg);
+            c.spec_prefill_enabled = true;
+        } else if (!strcmp(arg, "--spec-prefill-drafter-python")) {
+            c.spec_prefill_drafter_python = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--spec-prefill-drafter-script")) {
+            c.spec_prefill_drafter_script = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--spec-prefill-drafter-tokenizer")) {
+            c.spec_prefill_drafter_tokenizer = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--spec-prefill-score-lookahead")) {
+            c.spec_prefill_score_lookahead = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--spec-prefill-score-pool-kernel")) {
+            c.spec_prefill_score_pool_kernel = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else {
             server_log(DS4_LOG_DEFAULT, "ds4-server: unknown option: %s", arg);
             usage(stderr);
@@ -11598,6 +11995,11 @@ static server_config parse_options(int argc, char **argv) {
     }
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
+    }
+    if (c.spec_prefill_enabled && !c.spec_prefill_drafter_model) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: --spec-prefill requires --spec-prefill-drafter-model");
+        exit(2);
     }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.engine.distributed,
@@ -11653,6 +12055,17 @@ int main(int argc, char **argv) {
     s.engine = engine;
     s.session = session;
     s.default_tokens = cfg.default_tokens;
+    s.spec_prefill_enabled = cfg.spec_prefill_enabled;
+    s.spec_prefill_keep_pct = cfg.spec_prefill_keep_pct;
+    s.spec_prefill_sink = cfg.spec_prefill_sink;
+    s.spec_prefill_tail = cfg.spec_prefill_tail;
+    s.spec_prefill_chunk = cfg.spec_prefill_chunk;
+    s.spec_prefill_drafter_model = cfg.spec_prefill_drafter_model;
+    s.spec_prefill_drafter_python = cfg.spec_prefill_drafter_python;
+    s.spec_prefill_drafter_script = cfg.spec_prefill_drafter_script;
+    s.spec_prefill_drafter_tokenizer = cfg.spec_prefill_drafter_tokenizer;
+    s.spec_prefill_score_lookahead = cfg.spec_prefill_score_lookahead;
+    s.spec_prefill_score_pool_kernel = cfg.spec_prefill_score_pool_kernel;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
