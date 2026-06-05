@@ -10,12 +10,17 @@ endif
 DEBUG_FLAGS ?= -g
 CFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
 OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc
+ifeq ($(UNAME_S),Darwin)
+CFLAGS += -DACCELERATE_NEW_LAPACK
+OBJCFLAGS += -DACCELERATE_NEW_LAPACK
+endif
 
 LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
 
 ifeq ($(UNAME_S),Darwin)
-METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
+METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal -framework MetalPerformanceShaders -framework Accelerate
+CPU_LDLIBS := $(LDLIBS) -framework Accelerate
 CORE_OBJS = ds4.o ds4_distributed.o ds4_metal.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o
 else
@@ -32,6 +37,15 @@ CORE_OBJS = ds4.o ds4_distributed.o ds4_cuda.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 METAL_LDLIBS := $(LDLIBS)
+CPU_LDLIBS := $(LDLIBS)
+endif
+
+ifeq ($(UNAME_S),Darwin)
+DRAFTER_OBJS = ds4_drafter.o ds4_drafter_metal.o
+DRAFTER_CPU_OBJS = ds4_drafter_cpu.o
+else
+DRAFTER_OBJS = ds4_drafter.o
+DRAFTER_CPU_OBJS = $(DRAFTER_OBJS)
 endif
 
 .PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression
@@ -46,11 +60,11 @@ help:
 	@echo "  make test         Build and run tests"
 	@echo "  make clean        Remove build outputs"
 
-ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
-	$(CC) $(CFLAGS) -o $@ ds4_cli.o linenoise.o $(CORE_OBJS) $(METAL_LDLIBS)
+ds4: ds4_cli.o linenoise.o $(DRAFTER_OBJS) $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ ds4_cli.o linenoise.o $(DRAFTER_OBJS) $(CORE_OBJS) $(METAL_LDLIBS)
 
-ds4-server: ds4_server.o ds4_kvstore.o rax.o $(CORE_OBJS)
-	$(CC) $(CFLAGS) -o $@ ds4_server.o ds4_kvstore.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
+ds4-server: ds4_server.o ds4_kvstore.o rax.o $(DRAFTER_OBJS) $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ ds4_server.o ds4_kvstore.o rax.o $(DRAFTER_OBJS) $(CORE_OBJS) $(METAL_LDLIBS)
 
 ds4-bench: ds4_bench.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_bench.o $(CORE_OBJS) $(METAL_LDLIBS)
@@ -61,12 +75,12 @@ ds4-eval: ds4_eval.o $(CORE_OBJS)
 ds4-agent: ds4_agent.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_agent.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(METAL_LDLIBS)
 
-cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o rax.o $(CPU_CORE_OBJS)
-	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_kvstore.o rax.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
+cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o rax.o $(DRAFTER_CPU_OBJS) $(CPU_CORE_OBJS)
+	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o linenoise.o $(DRAFTER_CPU_OBJS) $(CPU_CORE_OBJS) $(CPU_LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_kvstore.o rax.o $(DRAFTER_CPU_OBJS) $(CPU_CORE_OBJS) $(CPU_LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o $(CPU_CORE_OBJS) $(CPU_LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o $(CPU_CORE_OBJS) $(CPU_LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o $(CPU_CORE_OBJS) $(CPU_LDLIBS)
 
 cuda-regression:
 	@echo "cuda-regression requires a CUDA build"
@@ -96,10 +110,10 @@ cuda:
 	fi
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH="$(CUDA_ARCH)"
 
-ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
+ds4: ds4_cli.o linenoise.o $(DRAFTER_OBJS) $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ds4-server: ds4_server.o ds4_kvstore.o rax.o $(CORE_OBJS)
+ds4-server: ds4_server.o ds4_kvstore.o rax.o $(DRAFTER_OBJS) $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 ds4-bench: ds4_bench.o $(CORE_OBJS)
@@ -111,12 +125,12 @@ ds4-eval: ds4_eval.o $(CORE_OBJS)
 ds4-agent: ds4_agent.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o rax.o $(CPU_CORE_OBJS)
-	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_kvstore.o rax.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
+cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o rax.o $(DRAFTER_OBJS) $(CPU_CORE_OBJS)
+	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o linenoise.o $(DRAFTER_OBJS) $(CPU_CORE_OBJS) $(CPU_LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_kvstore.o rax.o $(DRAFTER_OBJS) $(CPU_CORE_OBJS) $(CPU_LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o $(CPU_CORE_OBJS) $(CPU_LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o $(CPU_CORE_OBJS) $(CPU_LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o $(CPU_CORE_OBJS) $(CPU_LDLIBS)
 
 cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
@@ -125,13 +139,26 @@ endif
 ds4.o: ds4.c ds4.h ds4_distributed.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
-ds4_cli.o: ds4_cli.c ds4.h ds4_distributed.h linenoise.h
+ds4_cli.o: ds4_cli.c ds4.h ds4_drafter.h ds4_distributed.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
+
+ds4_drafter.o: ds4_drafter.c ds4_drafter.h ds4.h ds4_drafter_metal.h
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(CFLAGS) -DDS4_DRAFTER_HAS_METAL -c -o $@ ds4_drafter.c
+else
+	$(CC) $(CFLAGS) -c -o $@ ds4_drafter.c
+endif
+
+ds4_drafter_cpu.o: ds4_drafter.c ds4_drafter.h ds4.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_drafter.c
+
+ds4_drafter_metal.o: ds4_drafter_metal.m ds4_drafter_metal.h
+	$(CC) $(OBJCFLAGS) -c -o $@ ds4_drafter_metal.m
 
 ds4_distributed.o: ds4_distributed.c ds4_distributed.h ds4.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_distributed.c
 
-ds4_server.o: ds4_server.c ds4.h ds4_distributed.h ds4_kvstore.h rax.h
+ds4_server.o: ds4_server.c ds4.h ds4_drafter.h ds4_distributed.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
 
 ds4_bench.o: ds4_bench.c ds4.h
@@ -164,10 +191,10 @@ linenoise.o: linenoise.c linenoise.h
 ds4_cpu.o: ds4.c ds4.h ds4_distributed.h ds4_gpu.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
 
-ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_distributed.h linenoise.h
+ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_drafter.h ds4_distributed.h linenoise.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_cli.c
 
-ds4_server_cpu.o: ds4_server.c ds4.h ds4_distributed.h ds4_kvstore.h rax.h
+ds4_server_cpu.o: ds4_server.c ds4.h ds4_drafter.h ds4_distributed.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_server.c
 
 ds4_bench_cpu.o: ds4_bench.c ds4.h
@@ -188,11 +215,11 @@ ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ds4_test: ds4_test.o ds4_kvstore.o rax.o $(CORE_OBJS)
+ds4_test: ds4_test.o ds4_kvstore.o rax.o $(DRAFTER_OBJS) $(CORE_OBJS)
 ifeq ($(UNAME_S),Darwin)
-	$(CC) $(CFLAGS) -o $@ ds4_test.o ds4_kvstore.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
+	$(CC) $(CFLAGS) -o $@ ds4_test.o ds4_kvstore.o rax.o $(DRAFTER_OBJS) $(CORE_OBJS) $(METAL_LDLIBS)
 else
-	$(NVCC) $(NVCCFLAGS) -o $@ ds4_test.o ds4_kvstore.o rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
+	$(NVCC) $(NVCCFLAGS) -o $@ ds4_test.o ds4_kvstore.o rax.o $(DRAFTER_OBJS) $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
 test: ds4_test ds4-eval

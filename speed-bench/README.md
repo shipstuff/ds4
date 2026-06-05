@@ -34,7 +34,7 @@ from fixed one-shot prompts. The harness keeps the model process resident and
 uses the same cold-full-prompt semantics as the mini-01 Qwen validation:
 baseline and drafter both prefill the full accumulated transcript on each turn.
 
-First download the target model, DSV4 tokenizer, and the MLX drafter:
+First download the target model, DSV4 tokenizer, and the Qwen drafter:
 
 ```
 ./download_model.sh specprefill
@@ -52,14 +52,12 @@ drafter:
 On a single machine with enough unified memory, roughly >96 GB, run the target
 model and live drafter locally and use the normal `ds4>` prompt. Do not use
 `--spec-prefill-self-score` for this test; that path scores with the target model
-and is much slower than the resident MLX drafter path we validated.
+and is much slower than the resident Qwen drafter path we validated.
 
 With the default download paths:
 
 ```
 make ds4
-
-export PYTHONPATH="$HOME/projects/mlx-lm:${PYTHONPATH:-}"
 
 ./ds4 -m ./ds4flash.gguf \
   --ctx 65536 \
@@ -67,11 +65,12 @@ export PYTHONPATH="$HOME/projects/mlx-lm:${PYTHONPATH:-}"
   --spec-prefill-tail 256 \
   --spec-prefill-chunk 32 \
   --spec-prefill-cache fresh \
-  --spec-prefill-drafter-model ./gguf/qwen3.5-0.8b-mlx-4bit \
-  --spec-prefill-drafter-python python3 \
-  --spec-prefill-drafter-script speed-bench/ds4_live_drafter.py \
-  --spec-prefill-drafter-tokenizer ./gguf/dsv4-tokenizer
+  --spec-prefill-drafter-model ./gguf/qwen3.5-0.8b-mlx-4bit
 ```
+
+The native drafter is in-process. It does not require a separate drafter binary
+or an mlx-lm Python environment. The bundled Python helper remains available as
+a parity/reference path by passing the Python helper options explicitly.
 
 That lands at the normal `ds4>` prompt. Every turn, `fresh` mode has the live
 drafter score the full true transcript, then DS4 compresses and prefills the
@@ -113,9 +112,10 @@ The SpecPrefill mode uses the live local drafter by default:
 ./gguf/qwen3.5-0.8b-mlx-4bit
 ```
 
-Override it with `DRAFTER_MODEL=/path/to/mlx-drafter`. The DS4 target model,
-DSV4 tokenizer, drafter Python, and MLX checkout can be overridden with `MODEL`,
-`DRAFTER_TOKENIZER`, `DRAFTER_PYTHON`, and `MLX_LM_DIR`.
+Override it with `DRAFTER_MODEL=/path/to/qwen-drafter`. The DS4 target model can
+be overridden with `MODEL`. The launcher uses the native drafter backend by
+default; set `DRAFTER_BACKEND=python` to use the legacy Python helper and then
+override `DRAFTER_TOKENIZER`, `DRAFTER_PYTHON`, or `DRAFTER_SCRIPT` if needed.
 
 ### Server Mode
 
@@ -123,8 +123,6 @@ DSV4 tokenizer, drafter Python, and MLX checkout can be overridden with `MODEL`,
 request prefills:
 
 ```
-export PYTHONPATH="$PWD/../mlx-lm:${PYTHONPATH:-}"
-
 ./ds4-server -m ./ds4flash.gguf \
   --ctx 65536 \
   --host 127.0.0.1 \
@@ -133,10 +131,7 @@ export PYTHONPATH="$PWD/../mlx-lm:${PYTHONPATH:-}"
   --spec-prefill-tail 256 \
   --spec-prefill-chunk 32 \
   --spec-prefill-cache fresh \
-  --spec-prefill-drafter-model ./gguf/qwen3.5-0.8b-mlx-4bit \
-  --spec-prefill-drafter-python python3 \
-  --spec-prefill-drafter-script speed-bench/ds4_live_drafter.py \
-  --spec-prefill-drafter-tokenizer ./gguf/dsv4-tokenizer
+  --spec-prefill-drafter-model ./gguf/qwen3.5-0.8b-mlx-4bit
 ```
 
 Server SpecPrefill currently supports fresh compression. Existing live and disk

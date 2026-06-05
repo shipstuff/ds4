@@ -13,8 +13,8 @@ Response:
   OK <n_scores> <total_ms> <tokenize_ms> <score_ms> <align_ms>\n
   <n_scores little-endian float32 values>
 
-This process is intentionally persistent: the MLX/Qwen drafter is loaded once
-and reused across DS4 chat turns.
+This process is intentionally persistent: the drafter is loaded once and reused
+across DS4 chat turns.
 """
 
 from __future__ import annotations
@@ -22,11 +22,11 @@ from __future__ import annotations
 import argparse
 import array
 import bisect
+import math
 import os
 import struct
 import sys
 import time
-from pathlib import Path
 
 
 def realign_to_dsv4(scorer_scores, scorer_offsets, dsv4_offsets):
@@ -92,19 +92,29 @@ class FakeScorer:
 
 class MlxScorer:
     def __init__(self, args):
-        if args.mlx_lm_dir:
-            sys.path.insert(0, args.mlx_lm_dir)
-
-        import mlx.core as mx  # noqa: PLC0415
-        from mlx_lm import load  # noqa: PLC0415
-        from mlx_lm.spec_prefill import compute_keep_indices  # noqa: PLC0415
-        from transformers import AutoTokenizer  # noqa: PLC0415
+        try:
+            import mlx.core as mx  # noqa: PLC0415
+            import mlx_lm.spec_prefill as spec_prefill  # noqa: PLC0415
+            from mlx_lm import load  # noqa: PLC0415
+            from mlx_lm.spec_prefill import compute_keep_indices  # noqa: PLC0415
+            from transformers import AutoTokenizer  # noqa: PLC0415
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "live drafter helper requires installed Python packages: "
+                "mlx, mlx-lm, and transformers. Install them in the "
+                "--spec-prefill-drafter-python environment."
+            ) from exc
 
         self.mx = mx
+        self.spec_prefill = spec_prefill
         self.compute_keep_indices = compute_keep_indices
         self.n_lookahead = args.n_lookahead
         self.pool_kernel = args.pool_kernel
         self.prefill_step_size = args.prefill_step_size
+        self.keep_fraction = args.keep_fraction
+        self.block_size = args.block_size
+        self.sink_size = args.sink_size
+        self.tail_keep = args.tail_keep
 
         print(f"ds4-live-drafter: load scorer tokenizer {args.scorer_model}", file=sys.stderr, flush=True)
         self.scorer_tk = AutoTokenizer.from_pretrained(args.scorer_model, trust_remote_code=True)
@@ -121,6 +131,48 @@ class MlxScorer:
         scorer_enc = self.scorer_tk(text, return_offsets_mapping=True, add_special_tokens=False)
         scorer_ids = scorer_enc["input_ids"]
         scorer_offsets = list(scorer_enc["offset_mapping"])
+        if os.environ.get("DS4_DRAFTER_DEBUG_TOKENS") == "1":
+            if os.environ.get("DS4_DRAFTER_DEBUG_TOKEN_HASHES") == "1":
+                block = 256
+                hashes = []
+                for pos in range(0, len(scorer_ids), block):
+                    h = 0x14650FB0739D0383
+                    for tid in scorer_ids[pos : pos + block]:
+                        v = int(tid) & 0xFFFFFFFF
+                        for k in range(4):
+                            h ^= (v >> (k * 8)) & 0xFF
+                            h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+                    hashes.append(f"{h:016x}")
+                print(
+                    "PY_TOKEN_HASHES",
+                    len(scorer_ids),
+                    block,
+                    " ".join(hashes),
+                    file=sys.stderr,
+                    flush=True,
+                )
+            start, count = 0, 64
+            window = os.environ.get("DS4_DRAFTER_DEBUG_TOKEN_WINDOW")
+            if window:
+                try:
+                    start_s, count_s = window.split(":", 1)
+                    start, count = max(0, int(start_s)), max(0, int(count_s))
+                except ValueError:
+                    start, count = 0, 64
+            end = min(len(scorer_ids), start + count)
+            start = min(start, len(scorer_ids))
+            print(
+                "PY_TOKENS",
+                len(scorer_ids),
+                start,
+                end,
+                " ".join(
+                    f"{int(t)}:{int(a)}:{int(b)}"
+                    for t, (a, b) in zip(scorer_ids[start:end], scorer_offsets[start:end])
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
         if ds4_byte_offsets is not None:
             dsv4_offsets = byte_spans_to_char_spans(text, ds4_byte_offsets)
         else:
@@ -134,18 +186,29 @@ class MlxScorer:
             prompt,
             lookahead_steps=self.n_lookahead,
             pool_kernel=self.pool_kernel,
-            block_size=32,
-            keep_fraction=0.3,
+            block_size=self.block_size,
+            keep_fraction=self.keep_fraction,
             prefill_step_size=self.prefill_step_size,
-            sink_size=16,
-            tail_keep=256,
+            sink_size=self.sink_size,
+            tail_keep=self.tail_keep,
             aggregation="pool_then_max",
         )
         self.mx.eval(keep)
         scorer_scores = [0.0] * len(scorer_ids)
-        for i in keep.tolist():
+        keep_list = [int(i) for i in keep.tolist()]
+        for i in keep_list:
             if 0 <= int(i) < len(scorer_scores):
                 scorer_scores[int(i)] = 1.0
+        if os.environ.get("DS4_DRAFTER_DEBUG_KEEP") == "1":
+            print(
+                "PY_KEEP",
+                len(scorer_ids),
+                " ".join(str(i) for i in keep_list),
+                file=sys.stderr,
+                flush=True,
+            )
+        if os.environ.get("DS4_DRAFTER_DEBUG_BLOCKS") == "1":
+            self._debug_print_block_scores(prompt)
         t2 = time.perf_counter()
 
         dsv4_scores = normalize(realign_to_dsv4(scorer_scores, scorer_offsets, dsv4_offsets))
@@ -155,6 +218,61 @@ class MlxScorer:
             )
         t3 = time.perf_counter()
         return dsv4_scores, ((t1 - t0) * 1000.0, (t2 - t1) * 1000.0, (t3 - t2) * 1000.0)
+
+    def _debug_print_block_scores(self, prompt):
+        sp = self.spec_prefill
+        mx = self.mx
+        spec_cache = sp.cache_module.make_prompt_cache(self.model)
+        m = int(prompt.size)
+        last_logits = sp._chunked_prefill(self.model, prompt, spec_cache, self.prefill_step_size)
+        captured, handles = sp._install_query_capture(self.model)
+        try:
+            y = mx.argmax(last_logits[:, -1, :], axis=-1).astype(prompt.dtype)
+            mx.eval(y)
+            if os.environ.get("DS4_DRAFTER_DEBUG_ARGMAX") == "1":
+                print("PY_BLOCK_ARGMAX", int(y.item()), end="", file=sys.stderr, flush=True)
+            for _ in range(self.n_lookahead):
+                sp._reset_capture_step(handles)
+                logits = self.model(y[None], cache=spec_cache)
+                y = mx.argmax(logits[:, -1, :], axis=-1).astype(prompt.dtype)
+                mx.eval(y)
+                if os.environ.get("DS4_DRAFTER_DEBUG_ARGMAX") == "1":
+                    print(" " + str(int(y.item())), end="", file=sys.stderr, flush=True)
+        finally:
+            sp._remove_query_capture(handles)
+        if os.environ.get("DS4_DRAFTER_DEBUG_ARGMAX") == "1":
+            print(file=sys.stderr, flush=True)
+        layer_keys = sp._speculator_keys_for_prompt(spec_cache, m)
+        per_layer_probs = []
+        for slot, keys in zip(captured, layer_keys):
+            if not slot or keys is None:
+                continue
+            q_layer = mx.concatenate(slot, axis=2)
+            per_layer_probs.append(sp._layer_softmax_probs(q_layer, keys, q_layer.shape[-1]))
+        importance = sp._aggregate_pool_then_max(per_layer_probs, self.pool_kernel)
+        mx.eval(importance)
+        vals = [float(x) for x in importance.tolist()]
+        n_blocks = (m + self.block_size - 1) // self.block_size
+        block_scores = []
+        for b in range(n_blocks):
+            start = b * self.block_size
+            block = vals[start : min(start + self.block_size, m)]
+            if len(block) < self.block_size:
+                block = block + [-1.0e30] * (self.block_size - len(block))
+            block_scores.append((b, sum(block) / self.block_size))
+        k = max(1, int(math.ceil(self.keep_fraction * n_blocks)))
+        k = min(k, n_blocks)
+        block_scores.sort(key=lambda x: (-x[1], x[0]))
+        print(
+            "PY_BLOCKS",
+            m,
+            self.block_size,
+            n_blocks,
+            k,
+            " ".join(f"{b}:{s:.9g}" for b, s in block_scores),
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def send_error(msg: str) -> None:
@@ -179,11 +297,13 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--scorer-model", required=True)
     ap.add_argument("--dsv4-tokenizer", default="./gguf/dsv4-tokenizer")
-    ap.add_argument("--mlx-lm-dir",
-                    default=os.environ.get("MLX_LM_DIR", ""))
     ap.add_argument("--n-lookahead", type=int, default=4)
     ap.add_argument("--pool-kernel", type=int, default=13)
     ap.add_argument("--prefill-step-size", type=int, default=2048)
+    ap.add_argument("--keep-fraction", type=float, default=0.3)
+    ap.add_argument("--block-size", type=int, default=32)
+    ap.add_argument("--sink-size", type=int, default=16)
+    ap.add_argument("--tail-keep", type=int, default=256)
     args = ap.parse_args()
 
     scorer = FakeScorer() if args.scorer_model == "__fake__" else MlxScorer(args)

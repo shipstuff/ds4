@@ -366,8 +366,8 @@ int ds4_engine_score_prompt_validate(
         char *err, size_t errlen);
 
 /* Per-prompt-token attention-aggregation scoring against the loaded DSV4
- * model itself, on the CPU reference backend.  Algorithm mirrors the
- * SpecPrefill paper (and the mlx-lm port at the Python layer):
+ * model itself.  Algorithm mirrors the SpecPrefill paper's attention
+ * aggregation shape:
  *
  *   for layer in first `score_layers` attention layers:
  *       compute Q for every prompt position via the LoRA-projected MLA Q

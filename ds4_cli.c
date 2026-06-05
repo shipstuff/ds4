@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_drafter.h"
 #include "ds4_distributed.h"
 #include "linenoise.h"
 
@@ -73,6 +74,7 @@ typedef struct {
     int spec_prefill_recompress_at_pct;
     const char *spec_prefill_scores_path;
     const char *spec_prefill_drafter_model;
+    bool spec_prefill_drafter_native;
     const char *spec_prefill_drafter_python;
     const char *spec_prefill_drafter_script;
     const char *spec_prefill_drafter_tokenizer;
@@ -92,17 +94,11 @@ typedef struct {
 } cli_generation_options;
 
 typedef struct {
-    pid_t pid;
-    int in_fd;
-    FILE *out_fp;
-} cli_live_drafter;
-
-typedef struct {
     ds4_engine_options engine;
     ds4_dist_options *dist;
     cli_generation_options gen;
     char *prompt_owned;
-    cli_live_drafter drafter;
+    ds4_drafter drafter;
     bool inspect;
 } cli_config;
 
@@ -293,14 +289,20 @@ static void usage(FILE *fp) {
         "      arch-agnostic).\n"
         "  --spec-prefill-drafter-model PATH\n"
         "      Enable the live local drafter lane. ds4 starts a resident\n"
-        "      MLX/Qwen scorer helper and asks it for fresh scores at each\n"
+        "      scorer helper and asks it for fresh scores at each\n"
         "      SpecPrefill compression. No heuristic fallback is used.\n"
+        "  --spec-prefill-drafter-native\n"
+        "      Use the in-process native Qwen drafter backend. This is the\n"
+        "      default live-drafter backend; the flag is kept for scripts.\n"
         "  --spec-prefill-drafter-python PATH\n"
-        "      Python executable for the resident drafter helper. Default: python3.\n"
+        "      Use the legacy Python reference backend with this executable.\n"
+        "      Default executable when selected: python3.\n"
         "  --spec-prefill-drafter-script PATH\n"
-        "      Helper script. Default: speed-bench/ds4_live_drafter.py.\n"
+        "      Use the legacy Python reference backend with this helper script.\n"
+        "      Default: speed-bench/ds4_live_drafter.py.\n"
         "  --spec-prefill-drafter-tokenizer PATH\n"
-        "      DSV4 HF tokenizer directory. Default: ./gguf/dsv4-tokenizer.\n"
+        "      Use the legacy Python reference backend with this DSV4 HF\n"
+        "      tokenizer directory. Default: ./gguf/dsv4-tokenizer.\n"
         "  --spec-prefill-self-score\n"
         "      Score the prompt with ds4's own attention math (no external\n"
         "      draft).  Available on all backends; the scorer dispatches to\n"
@@ -397,6 +399,16 @@ static int parse_int(const char *s, const char *opt) {
     return (int)v;
 }
 
+static int parse_nonneg_int(const char *s, const char *opt) {
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (s[0] == '\0' || *end != '\0' || v < 0 || v > INT32_MAX) {
+        fprintf(stderr, "ds4: invalid value for %s: %s\n", opt, s);
+        exit(2);
+    }
+    return (int)v;
+}
+
 static uint64_t parse_u64(const char *s, const char *opt) {
     char *end = NULL;
     unsigned long long v = strtoull(s, &end, 10);
@@ -480,7 +492,6 @@ static int cli_live_drafter_score(cli_config *cfg, ds4_engine *engine,
                                   float **scores_out, int *scores_len_out,
                                   double *score_ms_out,
                                   char *err, size_t errlen);
-static void cli_live_drafter_stop(cli_config *cfg);
 
 typedef struct {
     int base_tokens;
@@ -1469,230 +1480,49 @@ static void repl_chat_status(const cli_config *cfg, const repl_chat *chat) {
     fflush(stdout);
 }
 
-static int write_all_fd(int fd, const void *buf, size_t len) {
-    const unsigned char *p = buf;
-    while (len > 0) {
-        ssize_t n = write(fd, p, len);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (n == 0) return -1;
-        p += (size_t)n;
-        len -= (size_t)n;
-    }
-    return 0;
-}
-
-static char *render_tokens_text(ds4_engine *engine, const ds4_tokens *tokens,
-                                size_t *out_len, uint32_t **spans_out) {
-    size_t len = 0;
-    size_t cap = 4096;
-    char *buf = malloc(cap);
-    if (!buf) return NULL;
-    uint32_t *spans = NULL;
-    if (spans_out) {
-        spans = malloc((size_t)tokens->len * 2u * sizeof(spans[0]));
-        if (!spans) {
-            free(buf);
-            return NULL;
-        }
-    }
-    for (int i = 0; i < tokens->len; i++) {
-        size_t piece_len = 0;
-        char *piece = ds4_token_text(engine, tokens->v[i], &piece_len);
-        if (!piece && piece_len > 0) {
-            free(spans);
-            free(buf);
-            return NULL;
-        }
-        const size_t start = len;
-        if (len + piece_len + 1 > cap) {
-            while (len + piece_len + 1 > cap) cap *= 2;
-            char *next = realloc(buf, cap);
-            if (!next) {
-                free(piece);
-                free(spans);
-                free(buf);
-                return NULL;
-            }
-            buf = next;
-        }
-        if (piece_len > 0) memcpy(buf + len, piece, piece_len);
-        len += piece_len;
-        if (spans) {
-            spans[(size_t)i * 2u + 0u] = start > UINT32_MAX ? UINT32_MAX : (uint32_t)start;
-            spans[(size_t)i * 2u + 1u] = len > UINT32_MAX ? UINT32_MAX : (uint32_t)len;
-        }
-        free(piece);
-    }
-    buf[len] = '\0';
-    if (out_len) *out_len = len;
-    if (spans_out) *spans_out = spans;
-    return buf;
-}
-
-static int cli_live_drafter_start(cli_config *cfg, char *err, size_t errlen) {
-    if (cfg->drafter.pid > 0) return 0;
-    const char *python = cfg->gen.spec_prefill_drafter_python ?
-        cfg->gen.spec_prefill_drafter_python : "python3";
-    const char *script = cfg->gen.spec_prefill_drafter_script ?
-        cfg->gen.spec_prefill_drafter_script : "speed-bench/ds4_live_drafter.py";
-    const char *tokenizer = cfg->gen.spec_prefill_drafter_tokenizer ?
-        cfg->gen.spec_prefill_drafter_tokenizer : "./gguf/dsv4-tokenizer";
-    char lookahead_arg[32];
-    char pool_arg[32];
-    snprintf(lookahead_arg, sizeof(lookahead_arg), "%d", cfg->gen.spec_prefill_score_lookahead);
-    snprintf(pool_arg, sizeof(pool_arg), "%d", cfg->gen.spec_prefill_score_pool_kernel);
-
-    int to_child[2];
-    int from_child[2];
-    if (pipe(to_child) != 0 || pipe(from_child) != 0) {
-        snprintf(err, errlen, "live drafter pipe failed: %s", strerror(errno));
-        return -1;
-    }
-    pid_t pid = fork();
-    if (pid < 0) {
-        snprintf(err, errlen, "live drafter fork failed: %s", strerror(errno));
-        close(to_child[0]); close(to_child[1]);
-        close(from_child[0]); close(from_child[1]);
-        return -1;
-    }
-    if (pid == 0) {
-        dup2(to_child[0], STDIN_FILENO);
-        dup2(from_child[1], STDOUT_FILENO);
-        close(to_child[0]); close(to_child[1]);
-        close(from_child[0]); close(from_child[1]);
-        execlp(python, python, "-u", script,
-               "--scorer-model", cfg->gen.spec_prefill_drafter_model,
-               "--dsv4-tokenizer", tokenizer,
-               "--n-lookahead", lookahead_arg,
-               "--pool-kernel", pool_arg,
-               (char *)NULL);
-        fprintf(stderr, "ds4: exec live drafter failed: %s\n", strerror(errno));
-        _exit(127);
-    }
-
-    close(to_child[0]);
-    close(from_child[1]);
-    FILE *out = fdopen(from_child[0], "rb");
-    if (!out) {
-        snprintf(err, errlen, "live drafter fdopen failed: %s", strerror(errno));
-        close(to_child[1]);
-        close(from_child[0]);
-        kill(pid, SIGTERM);
-        waitpid(pid, NULL, 0);
-        return -1;
-    }
-    cfg->drafter.pid = pid;
-    cfg->drafter.in_fd = to_child[1];
-    cfg->drafter.out_fp = out;
-    ds4_log(stderr, DS4_LOG_PREFILL,
-            "spec-prefill: live local drafter started pid=%ld model=%s\n",
-            (long)pid, cfg->gen.spec_prefill_drafter_model);
-
-    char ready[128];
-    if (!fgets(ready, sizeof(ready), cfg->drafter.out_fp)) {
-        snprintf(err, errlen, "live drafter closed before ready");
-        cli_live_drafter_stop(cfg);
-        return -1;
-    }
-    if (strcmp(ready, "READY\n") != 0) {
-        snprintf(err, errlen, "live drafter startup error: %.96s", ready);
-        cli_live_drafter_stop(cfg);
-        return -1;
-    }
-    ds4_log(stderr, DS4_LOG_PREFILL,
-            "spec-prefill: live local drafter ready pid=%ld\n",
-            (long)pid);
-    return 0;
-}
-
-static void cli_live_drafter_stop(cli_config *cfg) {
-    if (cfg->drafter.in_fd > 0) {
-        (void)write_all_fd(cfg->drafter.in_fd, "QUIT\n", 5);
-        close(cfg->drafter.in_fd);
-        cfg->drafter.in_fd = -1;
-    }
-    if (cfg->drafter.out_fp) {
-        fclose(cfg->drafter.out_fp);
-        cfg->drafter.out_fp = NULL;
-    }
-    if (cfg->drafter.pid > 0) {
-        waitpid(cfg->drafter.pid, NULL, 0);
-        cfg->drafter.pid = 0;
-    }
-}
-
 static int cli_live_drafter_score(cli_config *cfg, ds4_engine *engine,
                                   const ds4_tokens *prompt,
                                   float **scores_out, int *scores_len_out,
                                   double *score_ms_out,
                                   char *err, size_t errlen) {
-    *scores_out = NULL;
-    *scores_len_out = 0;
-    if (score_ms_out) *score_ms_out = 0.0;
-    if (cli_live_drafter_start(cfg, err, errlen) != 0) return -1;
-
-    size_t text_len = 0;
-    uint32_t *spans = NULL;
-    char *text = render_tokens_text(engine, prompt, &text_len, &spans);
-    if (!text) {
-        snprintf(err, errlen, "live drafter failed to render transcript");
-        return -1;
+    ds4_drafter_options opt = {
+        .backend = cfg->gen.spec_prefill_drafter_native ?
+            DS4_DRAFTER_BACKEND_NATIVE : DS4_DRAFTER_BACKEND_PYTHON,
+        .model = cfg->gen.spec_prefill_drafter_model,
+        .python = cfg->gen.spec_prefill_drafter_python,
+        .script = cfg->gen.spec_prefill_drafter_script,
+        .tokenizer = cfg->gen.spec_prefill_drafter_tokenizer,
+        .score_lookahead = cfg->gen.spec_prefill_score_lookahead,
+        .score_pool_kernel = cfg->gen.spec_prefill_score_pool_kernel,
+        .keep_pct = cfg->gen.spec_prefill_keep_pct,
+        .sink = cfg->gen.spec_prefill_sink,
+        .tail = cfg->gen.spec_prefill_tail,
+        .chunk = cfg->gen.spec_prefill_chunk,
+        .process_name = "ds4",
+    };
+    const bool was_started = cfg->drafter.pid > 0 || cfg->drafter.native != NULL;
+    ds4_drafter_score_stats stats = {0};
+    int rc = ds4_drafter_score(&cfg->drafter, &opt, engine, prompt,
+                               scores_out, scores_len_out, &stats,
+                               err, errlen);
+    if (rc != 0) return rc;
+    if (!was_started) {
+        ds4_log(stderr, DS4_LOG_PREFILL,
+                "spec-prefill: live local drafter ready backend=%s pid=%ld model=%s detail=\"%s\"\n",
+                cfg->drafter.active_backend == DS4_DRAFTER_BACKEND_NATIVE ? "native" : "python",
+                (long)cfg->drafter.pid,
+                cfg->gen.spec_prefill_drafter_model,
+                cfg->drafter.ready_detail);
     }
-
-    char header[128];
-    int header_len = snprintf(header, sizeof(header), "SCORE2 %d %zu\n",
-                              prompt->len, text_len);
-    if (header_len <= 0 || (size_t)header_len >= sizeof(header) ||
-        write_all_fd(cfg->drafter.in_fd, header, (size_t)header_len) != 0 ||
-        write_all_fd(cfg->drafter.in_fd, text, text_len) != 0 ||
-        write_all_fd(cfg->drafter.in_fd, spans,
-                     (size_t)prompt->len * 2u * sizeof(spans[0])) != 0) {
-        free(text);
-        free(spans);
-        snprintf(err, errlen, "live drafter request write failed: %s", strerror(errno));
-        return -1;
-    }
-    free(text);
-    free(spans);
-
-    char line[256];
-    if (!fgets(line, sizeof(line), cfg->drafter.out_fp)) {
-        snprintf(err, errlen, "live drafter closed before response");
-        return -1;
-    }
-    int n = 0;
-    double total_ms = 0.0, tokenize_ms = 0.0, score_ms = 0.0, align_ms = 0.0;
-    if (sscanf(line, "OK %d %lf %lf %lf %lf", &n, &total_ms, &tokenize_ms,
-               &score_ms, &align_ms) != 5) {
-        snprintf(err, errlen, "live drafter error: %.220s", line);
-        return -1;
-    }
-    if (n != prompt->len) {
-        snprintf(err, errlen, "live drafter returned %d scores for %d tokens",
-                 n, prompt->len);
-        return -1;
-    }
-    float *scores = malloc((size_t)n * sizeof(scores[0]));
-    if (!scores) {
-        snprintf(err, errlen, "out of memory reading live drafter scores");
-        return -1;
-    }
-    size_t got = fread(scores, sizeof(scores[0]), (size_t)n, cfg->drafter.out_fp);
-    if (got != (size_t)n) {
-        free(scores);
-        snprintf(err, errlen, "live drafter score payload truncated (%zu/%d)", got, n);
-        return -1;
-    }
-    *scores_out = scores;
-    *scores_len_out = n;
-    if (score_ms_out) *score_ms_out = total_ms;
+    if (score_ms_out) *score_ms_out = stats.total_ms;
     ds4_log(stderr, DS4_LOG_PREFILL,
             "spec-prefill: live drafter scored %d tokens in %.2f ms "
             "(tokenize=%.2f score=%.2f align=%.2f)\n",
-            n, total_ms, tokenize_ms, score_ms, align_ms);
+            *scores_len_out,
+            stats.total_ms,
+            stats.tokenize_ms,
+            stats.score_ms,
+            stats.align_ms);
     return 0;
 }
 
@@ -2082,11 +1912,32 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
     if (repl_chat_init(engine, &chat, cfg) != 0) return 1;
     if (cfg->gen.spec_prefill_enabled && cfg->gen.spec_prefill_drafter_model) {
         char err[256];
-        if (cli_live_drafter_start(cfg, err, sizeof(err)) != 0) {
+        ds4_drafter_options opt = {
+            .backend = cfg->gen.spec_prefill_drafter_native ?
+                DS4_DRAFTER_BACKEND_NATIVE : DS4_DRAFTER_BACKEND_PYTHON,
+            .model = cfg->gen.spec_prefill_drafter_model,
+            .python = cfg->gen.spec_prefill_drafter_python,
+            .script = cfg->gen.spec_prefill_drafter_script,
+            .tokenizer = cfg->gen.spec_prefill_drafter_tokenizer,
+            .score_lookahead = cfg->gen.spec_prefill_score_lookahead,
+            .score_pool_kernel = cfg->gen.spec_prefill_score_pool_kernel,
+            .keep_pct = cfg->gen.spec_prefill_keep_pct,
+            .sink = cfg->gen.spec_prefill_sink,
+            .tail = cfg->gen.spec_prefill_tail,
+            .chunk = cfg->gen.spec_prefill_chunk,
+            .process_name = "ds4",
+        };
+        if (ds4_drafter_start(&cfg->drafter, &opt, err, sizeof(err)) != 0) {
             fprintf(stderr, "ds4: %s\n", err);
             repl_chat_free(&chat);
             return 1;
         }
+        ds4_log(stderr, DS4_LOG_PREFILL,
+                "spec-prefill: live local drafter ready backend=%s pid=%ld model=%s detail=\"%s\"\n",
+                cfg->drafter.active_backend == DS4_DRAFTER_BACKEND_NATIVE ? "native" : "python",
+                (long)cfg->drafter.pid,
+                cfg->gen.spec_prefill_drafter_model,
+                cfg->drafter.ready_detail);
     }
 
     struct sigaction old_int;
@@ -2283,6 +2134,7 @@ static cli_config parse_options(int argc, char **argv) {
             .spec_prefill_recompress_at_pct = 85,
             .spec_prefill_scores_path = NULL,
             .spec_prefill_drafter_model = NULL,
+            .spec_prefill_drafter_native = true,
             .spec_prefill_drafter_python = "python3",
             .spec_prefill_drafter_script = "speed-bench/ds4_live_drafter.py",
             .spec_prefill_drafter_tokenizer = "./gguf/dsv4-tokenizer",
@@ -2436,9 +2288,9 @@ static cli_config parse_options(int argc, char **argv) {
                     parse_float_range(arg + 15, "--spec-prefill", 0.0f, 1.0f);
             }
         } else if (!strcmp(arg, "--spec-prefill-sink")) {
-            c.gen.spec_prefill_sink = parse_int(need_arg(&i, argc, argv, arg), arg);
+            c.gen.spec_prefill_sink = parse_nonneg_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--spec-prefill-tail")) {
-            c.gen.spec_prefill_tail = parse_int(need_arg(&i, argc, argv, arg), arg);
+            c.gen.spec_prefill_tail = parse_nonneg_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--spec-prefill-chunk")) {
             c.gen.spec_prefill_chunk = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--spec-prefill-cache")) {
@@ -2464,12 +2316,21 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--spec-prefill-drafter-model")) {
             c.gen.spec_prefill_drafter_model = need_arg(&i, argc, argv, arg);
             c.gen.spec_prefill_enabled = true;
+        } else if (!strcmp(arg, "--spec-prefill-drafter-native")) {
+            c.gen.spec_prefill_drafter_native = true;
+            c.gen.spec_prefill_enabled = true;
         } else if (!strcmp(arg, "--spec-prefill-drafter-python")) {
             c.gen.spec_prefill_drafter_python = need_arg(&i, argc, argv, arg);
+            c.gen.spec_prefill_drafter_native = false;
+            c.gen.spec_prefill_enabled = true;
         } else if (!strcmp(arg, "--spec-prefill-drafter-script")) {
             c.gen.spec_prefill_drafter_script = need_arg(&i, argc, argv, arg);
+            c.gen.spec_prefill_drafter_native = false;
+            c.gen.spec_prefill_enabled = true;
         } else if (!strcmp(arg, "--spec-prefill-drafter-tokenizer")) {
             c.gen.spec_prefill_drafter_tokenizer = need_arg(&i, argc, argv, arg);
+            c.gen.spec_prefill_drafter_native = false;
+            c.gen.spec_prefill_enabled = true;
         } else if (!strcmp(arg, "--spec-prefill-self-score")) {
             c.gen.spec_prefill_self_score = true;
             c.gen.spec_prefill_enabled = true;
@@ -2518,6 +2379,7 @@ static cli_config parse_options(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     cli_config cfg = parse_options(argc, argv);
+    ds4_drafter_init(&cfg.drafter);
 
     /* Spec-prefill dryrun runs purely in userspace on the compression
      * function — no engine, no model, no Metal.  Process it before we touch
@@ -2648,7 +2510,7 @@ int main(int argc, char **argv) {
     } else {
         rc = run_generation(engine, &cfg);
     }
-    cli_live_drafter_stop(&cfg);
+    ds4_drafter_stop(&cfg.drafter);
     ds4_engine_close(engine);
     ds4_dist_options_free(cfg.dist);
     free(cfg.prompt_owned);

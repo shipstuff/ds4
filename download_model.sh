@@ -79,11 +79,11 @@ Targets:
        enabled explicitly with --mtp when running ds4 or ds4-server.
 
   drafter
-       Download only the DSV4 tokenizer plus the MLX/Qwen drafter used by
+       Download only the DSV4 tokenizer plus the Qwen drafter weights used by
        SpecPrefill. Use this when the target GGUF already exists.
 
   specprefill
-       Download q2-imatrix, the DSV4 tokenizer, and the MLX/Qwen drafter.
+       Download q2-imatrix, the DSV4 tokenizer, and the Qwen drafter weights.
        This is the single-node SpecPrefill setup path for 96 GB+ machines.
 
 Options:
@@ -94,7 +94,7 @@ Environment:
   DS4_GGUF_DIR   Directory used for downloaded GGUF files.
                  Default: ./gguf
   DS4_DRAFTER_DIR
-                 Directory used for the MLX/Qwen drafter.
+                 Directory used for the Qwen drafter weights.
                  Default: ./gguf/qwen3.5-0.8b-mlx-4bit
   DS4_TOKENIZER_DIR
                  Directory used for the DSV4 tokenizer files.

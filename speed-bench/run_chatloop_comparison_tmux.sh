@@ -25,9 +25,9 @@ TMUX_BIN="${TMUX_BIN:-tmux}"
 MODEL="${MODEL:-$DS4_DIR/ds4flash.gguf}"
 DRAFTER_MODEL="${DRAFTER_MODEL:-$DS4_DIR/gguf/qwen3.5-0.8b-mlx-4bit}"
 DRAFTER_TOKENIZER="${DRAFTER_TOKENIZER:-$DS4_DIR/gguf/dsv4-tokenizer}"
+DRAFTER_BACKEND="${DRAFTER_BACKEND:-native}"
 DRAFTER_PYTHON="${DRAFTER_PYTHON:-python3}"
 DRAFTER_SCRIPT="${DRAFTER_SCRIPT:-speed-bench/ds4_live_drafter.py}"
-MLX_LM_DIR="${MLX_LM_DIR:-$DS4_DIR/../mlx-lm}"
 
 CTX="${CTX:-32768}"
 N_PREDICT="${N_PREDICT:-1024}"
@@ -65,9 +65,7 @@ base_cmd=(
   --model "$MODEL"
   --modes baseline drafter
   --drafter-model "$DRAFTER_MODEL"
-  --drafter-python "$DRAFTER_PYTHON"
-  --drafter-script "$DRAFTER_SCRIPT"
-  --drafter-tokenizer "$DRAFTER_TOKENIZER"
+  --drafter-backend "$DRAFTER_BACKEND"
   --ctx "$CTX"
   --n-predict "$N_PREDICT"
   --temp "$TEMP"
@@ -80,6 +78,17 @@ base_cmd=(
   --timeout "$TIMEOUT"
   --out-dir "$OUT_DIR"
 )
+
+if [[ "$DRAFTER_BACKEND" == "python" ]]; then
+  base_cmd+=(
+    --drafter-python "$DRAFTER_PYTHON"
+    --drafter-script "$DRAFTER_SCRIPT"
+    --drafter-tokenizer "$DRAFTER_TOKENIZER"
+  )
+elif [[ "$DRAFTER_BACKEND" != "native" ]]; then
+  echo "DRAFTER_BACKEND must be native or python, got: $DRAFTER_BACKEND" >&2
+  exit 1
+fi
 
 if [[ -n "$NEEDLE_DEPTHS" ]]; then
   base_cmd+=(--needle-depths "$NEEDLE_DEPTHS" --needle-target-chars "$NEEDLE_TARGET_CHARS")
@@ -108,7 +117,7 @@ if [[ -n "$EXTRA_ARGS" ]]; then
 fi
 
 printf -v command_str "%q " "${base_cmd[@]}"
-run_cmd="cd \"$DS4_DIR\"; export PYTHONPATH=\"$MLX_LM_DIR:\${PYTHONPATH:-}\"; $command_str 2>&1 | tee \"$LOG\""
+run_cmd="cd \"$DS4_DIR\"; $command_str 2>&1 | tee \"$LOG\""
 
 cat <<EOF
 chat-loop comparison
@@ -117,6 +126,7 @@ chat-loop comparison
   out dir:      $OUT_DIR
   model:        $MODEL
   drafter:      $DRAFTER_MODEL
+  backend:      $DRAFTER_BACKEND
   ctx:          $CTX
   n_predict:    $N_PREDICT
   distributed:  $DIST
@@ -130,8 +140,10 @@ fi
 require_path "$DS4_DIR/ds4" "ds4 binary"
 require_path "$MODEL" "target model"
 require_path "$DRAFTER_MODEL" "drafter model"
-require_path "$DRAFTER_TOKENIZER" "DSV4 tokenizer"
-require_path "$DS4_DIR/$DRAFTER_SCRIPT" "drafter helper"
+if [[ "$DRAFTER_BACKEND" == "python" ]]; then
+  require_path "$DRAFTER_TOKENIZER" "DSV4 tokenizer"
+  require_path "$DS4_DIR/$DRAFTER_SCRIPT" "drafter helper"
+fi
 
 "$TMUX_BIN" kill-session -t "$SESSION" 2>/dev/null || true
 "$TMUX_BIN" new-session -d -s "$SESSION" "$run_cmd"

@@ -156,10 +156,17 @@ def build_modes(args) -> list[ModeRun]:
             "--spec-prefill-tail", str(args.tail),
             "--spec-prefill-chunk", str(args.chunk),
             "--spec-prefill-drafter-model", args.drafter_model,
-            "--spec-prefill-drafter-python", args.drafter_python,
-            "--spec-prefill-drafter-script", args.drafter_script,
-            "--spec-prefill-drafter-tokenizer", args.drafter_tokenizer,
+            "--spec-prefill-score-lookahead", str(args.drafter_score_lookahead),
+            "--spec-prefill-score-pool-kernel", str(args.drafter_score_pool_kernel),
         ]
+        if args.drafter_backend == "native":
+            extra.append("--spec-prefill-drafter-native")
+        else:
+            extra += [
+                "--spec-prefill-drafter-python", args.drafter_python,
+                "--spec-prefill-drafter-script", args.drafter_script,
+                "--spec-prefill-drafter-tokenizer", args.drafter_tokenizer,
+            ]
         extra += ["--spec-prefill-cache", args.spec_prefill_cache]
         modes.append(ModeRun("drafter", extra))
     return modes
@@ -934,12 +941,19 @@ def main() -> int:
     ap.add_argument("--sink", type=int, default=16)
     ap.add_argument("--tail", type=int, default=256)
     ap.add_argument("--chunk", type=int, default=32)
+    ap.add_argument("--drafter-score-lookahead", type=int, default=4)
+    ap.add_argument("--drafter-score-pool-kernel", type=int, default=13)
     ap.add_argument("--modes", nargs="+",
                     default=["baseline", "drafter"],
                     choices=["baseline", "drafter"])
     ap.add_argument("--drafter-model",
                     default=os.environ.get("DRAFTER_MODEL", "./gguf/qwen3.5-0.8b-mlx-4bit"),
                     help="Resident live drafter model for --modes drafter.")
+    ap.add_argument("--drafter-backend",
+                    default=os.environ.get("DRAFTER_BACKEND", "native"),
+                    choices=["native", "python"],
+                    help="Drafter backend for SpecPrefill mode. Default native "
+                         "keeps scoring in-process; python is the legacy MLX helper.")
     ap.add_argument("--drafter-python",
                     default=os.environ.get("DRAFTER_PYTHON", "python3"))
     ap.add_argument("--drafter-script", default="speed-bench/ds4_live_drafter.py")
